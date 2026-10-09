@@ -61,14 +61,28 @@ mutant("m03_dedupe",
            "def _find_dedupe(jobs, key):\n"
            "    return None  # BUG: dedupe ignored\n\n"))
 
-# 4. no torn-tail handling -> traceback on corrupt tail
-mutant("m04_torn_tail",
-       "WAL torn tail never truncated (crash/traceback on corrupt tail)",
-       ["test_recovery.py::test_torn_tail_ignored"],
-       lambda s: replace_function(
-           s, "_truncate_torn_tail",
-           "def _truncate_torn_tail(path):\n"
-           "    return False  # BUG: torn tail not handled\n\n"))
+# 4. single copy of state (no write-ahead log): deleting the one file loses all
+mutant("m04_single_copy",
+       "state kept in a single file only (no redundant copy); "
+       "deleting that file loses every acknowledged job",
+       ["test_recovery.py::test_delete_any_single_file_preserves_jobs"],
+       lambda s: sub_once(
+           sub_once(
+               s,
+               'def load_state(dirpath):\n'
+               '    jobs = _load_snapshot(os.path.join(dirpath, "snapshot.json"))\n'
+               '    jobs.update(_load_wal(os.path.join(dirpath, "wal.log")))\n'
+               '    return jobs',
+               'def load_state(dirpath):\n'
+               '    # BUG: single copy of state; nothing to rebuild from\n'
+               '    return _load_snapshot(os.path.join(dirpath, "snapshot.json"))'),
+           '        elif dirty:\n'
+           '            append_wal(dirpath, [jobs[jid] for jid in sorted(dirty)\n'
+           '                                 if jid in jobs])\n'
+           '            write_snapshot(dirpath, jobs)',
+           '        elif dirty:\n'
+           '            # BUG: snapshot is the only durable copy\n'
+           '            write_snapshot(dirpath, jobs)'))
 
 # 5. expired leases never swept
 mutant("m05_lease",
@@ -101,14 +115,21 @@ mutant("m07_delay",
            "    cands = [j for j in jobs.values()\n"
            "             if j[\"status\"] == \"pending\"]  # BUG: run_at ignored"))
 
-# 8. compact doesn't truncate the WAL
+# 8. compact drops every non-pending job instead of preserving all jobs
 mutant("m08_compact",
-       "compact rewrites the snapshot but never truncates wal.log",
-       ["test_recovery.py::test_compact_truncates_log"],
+       "compact keeps only pending jobs (done/dead/claimed silently dropped)",
+       ["test_recovery.py::test_compact_reclaims_disk_space"],
        lambda s: sub_once(
            s,
-           "            truncate_wal(dirpath)\n",
-           "            pass  # BUG: wal.log not truncated\n"))
+           '        if ctx.get("compact"):\n'
+           '            write_snapshot(dirpath, jobs)\n'
+           '            truncate_wal(dirpath)',
+           '        if ctx.get("compact"):\n'
+           '            # BUG: compact archives away non-pending jobs\n'
+           '            write_snapshot(dirpath, {jid: j\n'
+           '                                     for jid, j in jobs.items()\n'
+           '                                     if j["status"] == "pending"})\n'
+           '            truncate_wal(dirpath)'))
 
 
 def main():

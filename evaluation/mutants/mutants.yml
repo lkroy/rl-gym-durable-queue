@@ -14,11 +14,12 @@ mutants:
     file: m03_dedupe
     must_fail:
     - test_dedupe.py::test_dedupe_same_key_returns_existing
-  m04_torn_tail:
-    bug: WAL torn tail never truncated (crash/traceback on corrupt tail)
-    file: m04_torn_tail
+  m04_single_copy:
+    bug: state kept in a single file only (no redundant copy); deleting that file
+      loses every acknowledged job
+    file: m04_single_copy
     must_fail:
-    - test_recovery.py::test_torn_tail_ignored
+    - test_recovery.py::test_delete_any_single_file_preserves_jobs
   m05_lease:
     bug: claim never sweeps expired leases
     file: m05_lease
@@ -36,7 +37,7 @@ mutants:
     must_fail:
     - test_scheduling.py::test_delayed_job_not_claimable
   m08_compact:
-    bug: compact rewrites the snapshot but never truncates wal.log
+    bug: compact keeps only pending jobs (done/dead/claimed silently dropped)
     file: m08_compact
     must_fail:
-    - test_recovery.py::test_compact_truncates_log
+    - test_recovery.py::test_compact_reclaims_disk_space

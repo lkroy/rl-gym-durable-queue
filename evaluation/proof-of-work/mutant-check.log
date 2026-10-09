@@ -3,11 +3,11 @@
 > python3 evaluation/check_mutants.py
 
 m01_priority: score=0.9333 must_fail=['test_scheduling.py::test_priority_order'] missing=[] -> CAUGHT
-m02_backoff: score=0.9500 must_fail=['test_retries.py::test_fail_backoff_requeue'] missing=[] -> CAUGHT
+m02_backoff: score=0.9250 must_fail=['test_retries.py::test_fail_backoff_requeue'] missing=[] -> CAUGHT
 m03_dedupe: score=0.9500 must_fail=['test_dedupe.py::test_dedupe_same_key_returns_existing'] missing=[] -> CAUGHT
-m04_torn_tail: score=0.9800 must_fail=['test_recovery.py::test_torn_tail_ignored'] missing=[] -> CAUGHT
+m04_single_copy: score=0.9500 must_fail=['test_recovery.py::test_delete_any_single_file_preserves_jobs'] missing=[] -> CAUGHT
 m05_lease: score=0.9000 must_fail=['test_lease.py::test_lease_expiry_reclaim', 'test_lease.py::test_complete_after_lease_expiry_fails'] missing=[] -> CAUGHT
 m06_complete: score=0.9458 must_fail=['test_cli.py::test_complete_pending_conflict'] missing=[] -> CAUGHT
-m07_delay: score=0.8833 must_fail=['test_scheduling.py::test_delayed_job_not_claimable'] missing=[] -> CAUGHT
-m08_compact: score=0.9800 must_fail=['test_recovery.py::test_compact_truncates_log'] missing=[] -> CAUGHT
+m07_delay: score=0.8583 must_fail=['test_scheduling.py::test_delayed_job_not_claimable'] missing=[] -> CAUGHT
+m08_compact: score=0.9750 must_fail=['test_recovery.py::test_compact_reclaims_disk_space'] missing=[] -> CAUGHT
 ALL MUTANTS CAUGHT

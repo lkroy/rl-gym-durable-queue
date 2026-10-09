@@ -4,26 +4,54 @@
 
 `reference-run.log` is the real output of `npm run check:reference`
 (reference installed as the solution, full verifier suite run).
-Result: **score 1.0, 34/34 checks passed**.
+Result: **score 1.0, 33/33 checks passed** (all categories: core,
+scheduling, retries, dedupe, lease, recovery, cli).
 
 ## Mutant verification
 
 `mutant-check.log` is the real output of `npm run check:mutants`.
 Result: **all 8 mutants caught** (each scores < 1.0 and fails its mapped
-checks).
+checks), including crash-safety mutants verified by real SIGKILL fault
+injection:
+- m04_single_copy (no redundant storage) — caught by single-file deletion
+- m08_compact (compact drops non-pending jobs) — caught by reclaim check
 
-## Frontier-model difficulty evaluation (OpenHands)
+## Frontier-model difficulty evaluation
 
-**Status: pending — models: TBD (pending client API keys).**
+**Status: partial — one model evaluated under a documented substitute
+protocol; second model and OpenHands runs still pending.**
 
-No model scores are claimed here. The two-model single-pass evaluation has
-NOT been run because it requires the client's OpenHands setup and frontier
-model API credentials, which were not provided.
+No scores are invented anywhere in this repo. What was actually run:
 
-Exact commands to run it once credentials are available:
+- `gemini-2.5-flash-run1.md` (+ `.response.txt`): one-shot direct API
+  evaluation against the original (overly prescriptive) spec.
+  **Score: 0.93 (32/34).** This exposed that the first spec read like an
+  implementation recipe, so the task was hardened (see below).
+- `gemini-2.5-flash-run2.md` (+ `.response.txt`): one-shot direct API
+  evaluation against the hardened spec (guarantees without prescribed
+  design; SIGKILL/single-file-deletion fault injection in the verifier).
+  **Score: 0.6708 (17/33).** Failure categories: exit-code discipline
+  (systematic), retry/backoff semantics, redundant storage, concurrency,
+  delayed scheduling.
+
+Protocol note (why not OpenHands): OpenHands requires a Docker daemon for
+its agent sandbox and none is available in this build environment, so the
+contract's exact harness could not run here. Rather than fabricate
+OpenHands logs, each evaluation above is exactly ONE API call — the full
+`task/instruction.md` plus the starter stub, one attempt, no iteration, no
+tool use — with the output scored by the real hidden verifier. This is
+strictly harsher than an OpenHands single pass (where the agent may take
+many read/write/run/debug actions), so these scores are the model's
+best case; an agentic run would face additional failure modes.
+
+Difficulty gate (< 0.30 for two different frontier models): **not yet
+demonstrated**. Recommendation: run the two contracted OpenHands
+evaluations with the exact commands below before judging the gate — if
+those also land well above 0.30, broaden the task's interacting
+workflows rather than tightening the spec further.
 
 ```bash
-# Model A (single pass)
+# Model A (single pass via OpenHands)
 export LLM_MODEL="<frontier-model-A>"
 export LLM_API_KEY="<key-A>"
 npm run generate          # agent builds $SOLUTION_DIR/q from task/instruction.md
@@ -37,6 +65,6 @@ npm run generate
 Q_BIN=/tmp/solution-b/q npm run score
 ```
 
-Difficulty gate: both models must score **below 0.30**. Record the model
-names, the OpenHands logs (`evaluation/proof-of-work/openhands-run.log`),
-scores and failure categories here when the runs complete.
+Record the model names, the OpenHands logs
+(`evaluation/proof-of-work/openhands-run.log`), scores and failure
+categories here when the runs complete.

@@ -1,0 +1,417 @@
+```python
+#!/usr/bin/env python3
+
+import sys
+import os
+import json
+import time
+import uuid
+import argparse
+import fcntl
+import tempfile
+import shutil
+
+# --- Constants and Utility Functions ---
+
+DEFAULT_QDATA_DIR = os.path.join(os.getcwd(), ".qdata")
+WAL_FILENAME = "wal.log"
+SNAPSHOT_FILENAME = "snapshot.json"
+LOCK_FILENAME = "lock" # Dedicated file for fcntl.flock
+
+JOB_STATUSES = {"pending", "claimed", "done", "dead"}
+
+# Exit codes
+EXIT_SUCCESS = 0
+EXIT_NO_JOBS_AVAILABLE = 1
+EXIT_VALIDATION_ERROR = 2
+EXIT_STATE_CONFLICT = 3
+EXIT_NOT_FOUND = 4
+
+def _exit_error(message, code):
+    """Prints an error message to stderr and exits with the given code."""
+    print(f"Error: {message}", file=sys.stderr)
+    sys.exit(code)
+
+def _validate_json(s, arg_name):
+    """Validates if a string is valid JSON."""
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        _exit_error(f"'{arg_name}' must be valid JSON.", EXIT_VALIDATION_ERROR)
+
+def _validate_id_format(job_id):
+    """Validates job ID format."""
+    # Regex equivalent: ^[A-Za-z0-9_-]{1,64}$
+    if not isinstance(job_id, str) or not (1 <= len(job_id) <= 64) or not all(c.isalnum() or c in ['_', '-'] for c in job_id):
+        _exit_error("Job ID must be 1-64 alphanumeric characters, underscores, or hyphens.", EXIT_VALIDATION_ERROR)
+
+# --- JobQueue Class ---
+
+class JobQueue:
+    def __init__(self, data_dir):
+        self.data_dir = data_dir
+        self.wal_path = os.path.join(data_dir, WAL_FILENAME)
+        self.snapshot_path = os.path.join(data_dir, SNAPSHOT_FILENAME)
+        self.lock_path = os.path.join(data_dir, LOCK_FILENAME)
+        self.jobs = {}  # In-memory store: {job_id: job_object}
+        self._lock_fd = None # File descriptor for the lock
+
+    def _ensure_data_dir(self):
+        """Ensures the data directory exists."""
+        os.makedirs(self.data_dir, exist_ok=True)
+
+    def _acquire_lock(self):
+        """Acquires an exclusive lock on the state directory."""
+        self._ensure_data_dir()
+        try:
+            # Open the lock file in append mode. If it doesn't exist, it's created.
+            # This file is only used for locking, its content is irrelevant.
+            self._lock_fd = open(self.lock_path, 'a')
+            fcntl.flock(self._lock_fd, fcntl.LOCK_EX)
+        except Exception as e:
+            _exit_error(f"Failed to acquire lock: {e}", EXIT_VALIDATION_ERROR)
+
+    def _release_lock(self):
+        """Releases the exclusive lock."""
+        if self._lock_fd:
+            try:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+                self._lock_fd.close()
+            except Exception as e:
+                # Log error but don't exit, as command might have completed successfully
+                print(f"Warning: Failed to release lock cleanly: {e}", file=sys.stderr)
+            finally:
+                self._lock_fd = None
+
+    def _load_state(self):
+        """Loads state from snapshot and replays WAL."""
+        self.jobs = {}
+
+        # 1. Load snapshot if present and parseable
+        if os.path.exists(self.snapshot_path):
+            try:
+                with open(self.snapshot_path, 'r') as f:
+                    snapshot_data = json.load(f)
+                    self.jobs = snapshot_data.get("jobs", {})
+            except (json.JSONDecodeError, FileNotFoundError, IOError) as e:
+                # Snapshot corrupt or unreadable, log and proceed with WAL only
+                print(f"Warning: Could not load snapshot.json ({e}). Rebuilding from wal.log.", file=sys.stderr)
+                self.jobs = {} # Ensure jobs dict is empty if snapshot was corrupt
+
+        # 2. Replay WAL
+        try:
+            with open(self.wal_path, 'r+') as f:
+                f.seek(0) # Ensure we read from the beginning
+                valid_bytes_read = 0
+                for line_num, line in enumerate(f):
+                    try:
+                        entry = json.loads(line)
+                        if entry.get("op") == "upsert" and "job" in entry:
+                            job = entry["job"]
+                            self.jobs[job["id"]] = job
+                        valid_bytes_read += len(line.encode('utf-8')) # Use byte length for truncation
+                    except json.JSONDecodeError:
+                        # Torn tail detected. Truncate the file at this point.
+                        f.seek(valid_bytes_read)
+                        f.truncate()
+                        print(f"Warning: Truncated wal.log at line {line_num + 1} due to torn tail.", file=sys.stderr)
+                        break # Stop processing WAL after truncation
+        except FileNotFoundError:
+            # wal.log doesn't exist, no problem
+            pass
+        except IOError as e:
+            _exit_error(f"Error reading wal.log: {e}", EXIT_VALIDATION_ERROR)
+
+    def _write_wal(self, job):
+        """Appends an upsert operation to the WAL and fsyncs."""
+        self.jobs[job["id"]] = job # Update in-memory state immediately
+        entry = {"op": "upsert", "job": job}
+        try:
+            with open(self.wal_path, 'a') as f:
+                f.write(json.dumps(entry) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except IOError as e:
+            _exit_error(f"Error writing to wal.log: {e}", EXIT_VALIDATION_ERROR)
+
+    def _rewrite_snapshot(self):
+        """Rewrites snapshot.json atomically and truncates wal.log."""
+        snapshot_data = {"jobs": self.jobs}
+        
+        # Write to a temporary file
+        temp_fd, temp_path = tempfile.mkstemp(dir=self.data_dir, prefix="snapshot_temp_")
+        try:
+            with os.fdopen(temp_fd, 'w') as f:
+                json.dump(snapshot_data, f)
+                f.flush()
+                os.fsync(f.fileno()) # Ensure data is on disk
+            
+            # Atomically replace the old snapshot with the new one
+            os.rename(temp_path, self.snapshot_path)
+            
+            # Truncate wal.log after successful snapshot rewrite
+            with open(self.wal_path, 'w') as f:
+                f.truncate(0)
+                f.flush()
+                os.fsync(f.fileno()) # Ensure truncation is on disk
+        except IOError as e:
+            # Clean up temp file on error
+            if os.path.exists(temp_path):
+                os.remove(temp_path) 
+            _exit_error(f"Error during snapshot rewrite or WAL truncation: {e}", EXIT_VALIDATION_ERROR)
+
+    def _sweep_expired_leases(self):
+        """Moves claimed jobs with expired leases back to pending."""
+        now = time.time()
+        updated_jobs = []
+        # Iterate on a copy of values to allow modification of self.jobs
+        for job_id, job in list(self.jobs.items()): 
+            if job["status"] == "claimed" and \
+               job["lease_expires_at"] is not None and \
+               job["lease_expires_at"] <= now:
+                
+                # Create a copy to modify and write to WAL
+                updated_job = job.copy() 
+                updated_job["status"] = "pending"
+                updated_job["claimed_at"] = None
+                updated_job["lease_expires_at"] = None
+                updated_jobs.append(updated_job)
+        
+        for job in updated_jobs:
+            self._write_wal(job) # Write each update to WAL
+
+    def _run_command(self, func, *args, **kwargs):
+        """Wrapper to handle the per-command lifecycle."""
+        self._acquire_lock()
+        try:
+            self._load_state()
+            self._sweep_expired_leases() # Sweep leases before command execution
+            return func(*args, **kwargs)
+        finally:
+            self._release_lock()
+
+    # --- Commands Implementation ---
+
+    def enqueue(self, payload, priority, delay, job_id, dedupe_key, max_attempts):
+        now = time.time()
+
+        # Validate inputs
+        if delay < 0:
+            _exit_error("Delay cannot be negative.", EXIT_VALIDATION_ERROR)
+        if max_attempts < 1:
+            _exit_error("Max attempts must be >= 1.", EXIT_VALIDATION_ERROR)
+        
+        # Dedupe logic
+        if dedupe_key:
+            for existing_job_id, existing_job in self.jobs.items():
+                if existing_job.get("dedupe_key") == dedupe_key and \
+                   existing_job["status"] in ("pending", "claimed"):
+                    print(existing_job_id)
+                    sys.exit(EXIT_SUCCESS)
+
+        # Generate ID if not provided, otherwise validate and check for uniqueness
+        if not job_id:
+            job_id = uuid.uuid4().hex[:16]
+        else:
+            _validate_id_format(job_id)
+            if job_id in self.jobs:
+                _exit_error(f"Job ID '{job_id}' already exists.", EXIT_VALIDATION_ERROR)
+
+        new_job = {
+            "id": job_id,
+            "payload": payload,
+            "priority": priority,
+            "max_attempts": max_attempts,
+            "attempts": 0,
+            "status": "pending",
+            "created_at": now,
+            "run_at": now + delay,
+            "dedupe_key": dedupe_key,
+            "claimed_at": None,
+            "lease_expires_at": None,
+            "last_error": None,
+            "result": None,
+        }
+        self._write_wal(new_job)
+        print(new_job["id"])
+
+    def list_jobs(self, status_filter):
+        filtered_jobs = []
+        for job in self.jobs.values():
+            if status_filter is None or job["status"] == status_filter:
+                filtered_jobs.append({
+                    "id": job["id"],
+                    "status": job["status"],
+                    "priority": job["priority"],
+                    "attempts": job["attempts"],
+                    "created_at": job["created_at"],
+                    "run_at": job["run_at"],
+                })
+
+        # Sort by created_at ascending, then id ascending
+        filtered_jobs.sort(key=lambda j: (j["created_at"], j["id"]))
+        print(json.dumps(filtered_jobs))
+
+    def show_job(self, job_id):
+        job = self.jobs.get(job_id)
+        if not job:
+            _exit_error("job not found", EXIT_NOT_FOUND)
+        print(json.dumps(job))
+
+    def claim_job(self, lease_seconds):
+        if lease_seconds <= 0:
+            _exit_error("Lease duration must be greater than 0.", EXIT_VALIDATION_ERROR)
+
+        now = time.time()
+        
+        # Candidate jobs: status 'pending' AND 'run_at <= now'
+        candidates = []
+        for job in self.jobs.values():
+            if job["status"] == "pending" and job["run_at"] <= now:
+                candidates.append(job)
+
+        # Order: priority descending, then created_at ascending, then id ascending
+        candidates.sort(key=lambda j: (-j["priority"], j["created_at"], j["id"]))
+
+        if not candidates:
+            _exit_error("no jobs available", EXIT_NO_JOBS_AVAILABLE)
+
+        claimed_job = candidates[0].copy() # Work on a copy to modify
+        claimed_job["status"] = "claimed"
+        claimed_job["claimed_at"] = now
+        claimed_job["lease_expires_at"] = now + lease_seconds
+        
+        self._write_wal(claimed_job)
+        print(json.dumps(claimed_job))
+
+    def complete_job(self, job_id, result):
+        job = self.jobs.get(job_id)
+        if not job:
+            _exit_error("job not found", EXIT_NOT_FOUND)
+        
+        if job["status"] != "claimed":
+            _exit_error("not claimed", EXIT_STATE_CONFLICT)
+
+        updated_job = job.copy()
+        updated_job["status"] = "done"
+        updated_job["result"] = result
+        self._write_wal(updated_job)
+        print(job_id)
+
+    def fail_job(self, job_id, error_message):
+        job = self.jobs.get(job_id)
+        if not job:
+            _exit_error("job not found", EXIT_NOT_FOUND)
+
+        if job["status"] != "claimed":
+            _exit_error("not claimed", EXIT_STATE_CONFLICT)
+
+        updated_job = job.copy()
+        updated_job["attempts"] += 1
+        updated_job["last_error"] = error_message
+        updated_job["claimed_at"] = None
+        updated_job["lease_expires_at"] = None
+
+        if updated_job["attempts"] >= updated_job["max_attempts"]:
+            updated_job["status"] = "dead"
+        else:
+            updated_job["status"] = "pending"
+            # Exponential backoff: 10s, 20s, 40s, ...
+            updated_job["run_at"] = time.time() + (10 * (2**(updated_job["attempts"] - 1)))
+        
+        self._write_wal(updated_job)
+        print(job_id)
+
+    def get_stats(self):
+        stats = {"pending": 0, "claimed": 0, "done": 0, "dead": 0, "total": 0}
+        for job in self.jobs.values():
+            stats[job["status"]] += 1
+            stats["total"] += 1
+        print(json.dumps(stats))
+
+    def compact(self):
+        # The _rewrite_snapshot method already handles truncating wal.log
+        self._rewrite_snapshot()
+        print("ok")
+
+# --- Main Execution Logic ---
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Durable Job Queue `q`",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    
+    # Determine data directory
+    qdata_dir = os.environ.get("QDATA_DIR", DEFAULT_QDATA_DIR)
+    
+    # Initialize JobQueue. State loading and locking handled by _run_command.
+    q = JobQueue(qdata_dir)
+
+    subparsers = parser.add_subparsers(dest="command", required=True, help="Available commands")
+
+    # Enqueue command
+    enqueue_parser = subparsers.add_parser("enqueue", help="Enqueue a new job")
+    enqueue_parser.add_argument("--payload", required=True, help="Job payload (JSON string)")
+    enqueue_parser.add_argument("--priority", type=int, default=0, help="Job priority (default: 0)")
+    enqueue_parser.add_argument("--delay", type=int, default=0, help="Delay before job can run, in seconds (default: 0)")
+    enqueue_parser.add_argument("--id", help="Explicit job ID (1-64 alphanumeric, _, -). Auto-generated if not provided.")
+    enqueue_parser.add_argument("--dedupe-key", help="Key to deduplicate pending/claimed jobs.")
+    enqueue_parser.add_argument("--max-attempts", type=int, default=3, help="Maximum number of attempts before job is dead (default: 3)")
+
+    # List command
+    list_parser = subparsers.add_parser("list", help="List jobs")
+    list_parser.add_argument("--status", choices=list(JOB_STATUSES), help="Filter by job status")
+
+    # Show command
+    show_parser = subparsers.add_parser("show", help="Show full job details")
+    show_parser.add_argument("ID", help="Job ID")
+
+    # Claim command
+    claim_parser = subparsers.add_parser("claim", help="Claim an available job")
+    claim_parser.add_argument("--lease", type=int, default=60, help="Lease duration in seconds (default: 60)")
+
+    # Complete command
+    complete_parser = subparsers.add_parser("complete", help="Mark a claimed job as complete")
+    complete_parser.add_argument("ID", help="Job ID")
+    complete_parser.add_argument("--result", help="Job result (JSON string)")
+
+    # Fail command
+    fail_parser = subparsers.add_parser("fail", help="Mark a claimed job as failed")
+    fail_parser.add_argument("ID", help="Job ID")
+    fail_parser.add_argument("--error", help="Error message")
+
+    # Stats command
+    stats_parser = subparsers.add_parser("stats", help="Show queue statistics")
+
+    # Compact command
+    compact_parser = subparsers.add_parser("compact", help="Rewrite snapshot and truncate WAL")
+
+    args = parser.parse_args()
+
+    # Dispatch commands
+    if args.command == "enqueue":
+        payload = _validate_json(args.payload, "--payload")
+        q._run_command(q.enqueue, payload, args.priority, args.delay, args.id, args.dedupe_key, args.max_attempts)
+    elif args.command == "list":
+        q._run_command(q.list_jobs, args.status)
+    elif args.command == "show":
+        q._run_command(q.show_job, args.ID)
+    elif args.command == "claim":
+        q._run_command(q.claim_job, args.lease)
+    elif args.command == "complete":
+        result = _validate_json(args.result, "--result") if args.result else None
+        q._run_command(q.complete_job, args.ID, result)
+    elif args.command == "fail":
+        q._run_command(q.fail_job, args.ID, args.error)
+    elif args.command == "stats":
+        q._run_command(q.get_stats)
+    elif args.command == "compact":
+        q._run_command(q.compact)
+    else:
+        # This case should ideally not be reached due to required=True in subparsers
+        _exit_error(f"Unknown command: {args.command}", EXIT_VALIDATION_ERROR)
+
+if __name__ == "__main__":
+    main()
+```

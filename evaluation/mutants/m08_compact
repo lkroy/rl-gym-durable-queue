@@ -394,8 +394,11 @@ def main(argv):
         ctx = {}
         code = COMMANDS[args.cmd](args, jobs, t, dirty, ctx)
         if ctx.get("compact"):
-            write_snapshot(dirpath, jobs)
-            pass  # BUG: wal.log not truncated
+            # BUG: compact archives away non-pending jobs
+            write_snapshot(dirpath, {jid: j
+                                     for jid, j in jobs.items()
+                                     if j["status"] == "pending"})
+            truncate_wal(dirpath)
         elif dirty:
             append_wal(dirpath, [jobs[jid] for jid in sorted(dirty)
                                  if jid in jobs])

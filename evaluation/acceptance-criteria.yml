@@ -7,42 +7,30 @@ acceptance_criteria:
       - test_cli.py::test_stats_empty
       - test_cli.py::test_default_qdata_dir
 
-  REQ-WAL:
-    description: wal.log is append-only, one {"op":"upsert","job":...} JSON object per line.
+  REQ-REDUNDANCY:
+    description: No single file under $QDATA_DIR is a single point of failure; deleting any one file preserves all acknowledged jobs.
     checks:
-      - test_core.py::test_enqueue_prints_id
-      - test_core.py::test_wal_and_snapshot_format
-      - test_recovery.py::test_compact_truncates_log
+      - test_recovery.py::test_delete_any_single_file_preserves_jobs
+      - test_core.py::test_state_persisted_to_disk
 
-  REQ-SNAPSHOT:
-    description: snapshot.json holds {"jobs": {id: job}} full state.
-    checks:
-      - test_core.py::test_wal_and_snapshot_format
-      - test_recovery.py::test_missing_snapshot_rebuilds_from_log
-      - test_recovery.py::test_compact_truncates_log
-
-  REQ-STARTUP-REPLAY:
-    description: Startup loads snapshot then replays wal.log in order; later lines win.
+  REQ-RESTART:
+    description: A fresh process sees every previously acknowledged job; state persists across processes.
     checks:
       - test_core.py::test_claim_complete_flow
-      - test_recovery.py::test_missing_snapshot_rebuilds_from_log
-      - test_recovery.py::test_log_replay_later_wins
+      - test_core.py::test_state_persisted_to_disk
+      - test_recovery.py::test_delete_any_single_file_preserves_jobs
 
-  REQ-TORN-TAIL:
-    description: Trailing partial line (missing newline / invalid JSON) is ignored and truncated; queue stays operational.
+  REQ-CRASH-ATOMICITY:
+    description: SIGKILL mid-command never corrupts the queue; the next command exits 0, acknowledged jobs are intact, the in-flight op took effect at most once.
     checks:
-      - test_recovery.py::test_torn_tail_ignored
-
-  REQ-SNAPSHOT-RESILIENCE:
-    description: Missing or corrupt snapshot.json does not lose data; rebuilt from wal.log.
-    checks:
-      - test_recovery.py::test_missing_snapshot_rebuilds_from_log
-      - test_recovery.py::test_corrupt_snapshot_rebuilds_from_log
+      - test_recovery.py::test_kill_mid_enqueue_never_corrupts
+      - test_recovery.py::test_kill_mid_compact_never_loses_jobs
 
   REQ-COMPACT:
-    description: compact rewrites snapshot from current state and truncates wal.log.
+    description: compact preserves every job regardless of status and reclaims disk space once state has grown.
     checks:
-      - test_recovery.py::test_compact_truncates_log
+      - test_recovery.py::test_compact_reclaims_disk_space
+      - test_recovery.py::test_kill_mid_compact_never_loses_jobs
 
   REQ-CONCURRENCY:
     description: Concurrent processes never deliver the same job twice; mutations are atomic.

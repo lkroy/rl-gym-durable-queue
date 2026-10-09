@@ -70,16 +70,14 @@ def test_stats_counts(q):
                                "dead": 0, "total": 2}
 
 
-def test_wal_and_snapshot_format(q):
+def test_state_persisted_to_disk(q):
     import os
-    jid = q.run("enqueue", "--payload", '{"a":1}', "--id", "fmt1").stdout.strip()
-    with open(os.path.join(q.qdata, "wal.log")) as f:
-        lines = f.read().splitlines()
-    assert len(lines) == 1  # exactly one line per mutation
-    op = json.loads(lines[0])
-    assert op["op"] == "upsert"
-    assert op["job"]["id"] == jid
-    with open(os.path.join(q.qdata, "snapshot.json")) as f:
-        snap = json.load(f)
-    assert set(snap) == {"jobs"}
-    assert snap["jobs"][jid]["id"] == jid
+    cp = q.run("enqueue", "--payload", '{"a":1}', "--id", "persist1")
+    assert cp.returncode == 0, cp.stderr
+    files = [f for f in os.listdir(q.qdata)
+             if os.path.isfile(os.path.join(q.qdata, f))]
+    assert files, "expected state files under $QDATA_DIR after enqueue"
+    total = sum(os.path.getsize(os.path.join(q.qdata, f)) for f in files)
+    assert total > 0, "state files are empty"
+    # a fresh process sees the same job (durability across processes)
+    assert q.json("show", "persist1")["payload"] == {"a": 1}

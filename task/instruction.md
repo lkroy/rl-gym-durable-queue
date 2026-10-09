@@ -12,30 +12,33 @@ via an absolute path). It MUST be executable (`chmod +x`).
   If unset, default to `./.qdata` (relative to the current working directory).
 - The program MUST create the state directory if it does not exist.
 
-## On-disk contract (observable file states)
+## Durability & crash-recovery contract
 
-- `$QDATA_DIR/wal.log`: append-only write-ahead log. One JSON object per
-  line, each of the form `{"op": "upsert", "job": <full job object>}`.
-  Exactly one line is appended per job mutation.
-- `$QDATA_DIR/snapshot.json`: a full snapshot of the form
-  `{"jobs": {"<id>": <full job object>, ...}}`. This file MAY be absent.
-- Startup: every command MUST load `snapshot.json` first (if present and
-  parseable), then replay `wal.log` lines in order; when both contain the
-  same job id, the LATER log line wins.
-- Torn tail: a trailing partial line in `wal.log` — missing its terminating
-  newline, or not valid JSON (as left behind by a crashed writer) — MUST be
-  ignored and truncated from the file. The queue MUST remain fully
-  operational afterwards (exit code 0 on the next command).
-- A missing OR unreadable/corrupt `snapshot.json` MUST NOT lose data: the
-  queue MUST be rebuilt from `wal.log` alone.
-- `q compact` MUST rewrite `snapshot.json` from the current in-memory state
-  and truncate `wal.log` to empty.
+How state is stored under `$QDATA_DIR` is entirely up to you — file names,
+formats, and data structures are your design choice. What is graded is that
+these guarantees hold observably:
+
+- Durability: once a command has exited 0, its effects MUST survive the
+  process being killed (SIGKILL) at any later moment. Data MUST reach
+  durable storage (fsync) before the command reports success.
+- Crash atomicity: if a `q` process is killed (SIGKILL) in the middle of ANY
+  command, the queue MUST NOT be left half-written or unreadable. The very
+  next `q` invocation MUST exit 0 and see every previously acknowledged job
+  intact; the interrupted operation itself MUST have taken effect at most
+  once (it may have fully completed or not at all — never partially, never
+  duplicated).
+- Redundancy: while no `q` process is running, the verifier WILL delete a
+  single file inside `$QDATA_DIR` — any one it chooses. Afterwards every
+  acknowledged job MUST still be intact and the queue fully operational.
+  Design your storage so that no single file is a single point of failure.
+- `q compact` MUST preserve every job, whatever its status, and MUST reduce
+  the total bytes stored under `$QDATA_DIR` once the queue has grown through
+  many operations (it is the mechanism that reclaims space from the
+  redundant storage above). A process killed (SIGKILL) in the middle of
+  `q compact` MUST NOT lose any acknowledged job.
 - Concurrency: multiple `q` processes running at the same time MUST NEVER
-  deliver (claim) the same job twice. Mutations MUST be atomic: a process
-  killed mid-command MUST NOT leave the queue in a half-written state.
-- Durability: after a command exits 0, its effects MUST survive a process
-  kill (data MUST be fsynced to disk, and snapshot rewrites MUST be atomic
-  via temp-file + fsync + rename).
+  deliver (claim) the same job twice, and concurrent mutations MUST NOT
+  corrupt the queue. Serialize access with OS-level locking.
 
 ## Job object
 
@@ -133,10 +136,3 @@ print a message to stderr.
 - 2: usage / validation error
 - 3: state conflict (complete/fail on a job that is not claimed)
 - 4: not found (unknown job id)
-
-## Per-command lifecycle
-
-Every command conceptually performs: acquire an exclusive lock on the state
-directory, load (snapshot + WAL replay + torn-tail truncation), sweep
-expired leases, execute, append WAL line(s) and fsync, atomically rewrite
-the snapshot (temp file + fsync + rename), release the lock.

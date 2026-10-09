@@ -1,0 +1,516 @@
+```python
+#!/usr/bin/env python3
+
+import os
+import sys
+import json
+import time
+import argparse
+import fcntl
+import uuid
+import re
+import shutil
+
+# --- Constants ---
+DEFAULT_QDATA_DIR = os.path.join(os.getcwd(), ".qdata")
+LOCK_FILE_NAME = "lock"
+SNAPSHOT_FILE_NAME = "snapshot.json"
+WAL_FILE_NAME = "wal.log"
+
+DEFAULT_LEASE_SECONDS = 60
+DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_PRIORITY = 0
+BACKOFF_BASE_SECONDS = 10
+
+JOB_ID_LENGTH = 16
+JOB_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+STATUS_PENDING = "pending"
+STATUS_CLAIMED = "claimed"
+STATUS_DONE = "done"
+STATUS_DEAD = "dead"
+
+# --- Utility Functions ---
+
+def _eprint(*args, **kwargs):
+    """Prints to stderr."""
+    print(*args, file=sys.stderr, **kwargs)
+
+def _get_qdata_dir():
+    """Determines the path to the state directory."""
+    return os.environ.get("QDATA_DIR") or DEFAULT_QDATA_DIR
+
+def _fsync_dir(path):
+    """fsyncs a directory to ensure metadata durability."""
+    # os.fsync only works on file descriptors.
+    # To fsync a directory, we need to open it.
+    fd = -1
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        os.fsync(fd)
+    except OSError as e:
+        _eprint(f"Warning: Could not fsync directory {path}: {e}")
+    finally:
+        if fd != -1:
+            os.close(fd)
+
+class QLock:
+    """Context manager for acquiring and releasing a file lock."""
+    def __init__(self, lock_file_path):
+        self.lock_file_path = lock_file_path
+        self.fd = None
+
+    def __enter__(self):
+        # Open in append mode, create if not exists
+        self.fd = open(self.lock_file_path, "a")
+        # Acquire an exclusive lock (blocking)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.fd:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            self.fd.close()
+            self.fd = None
+
+class JobQueue:
+    def __init__(self, qdata_dir):
+        self.qdata_dir = qdata_dir
+        self.lock_file = os.path.join(qdata_dir, LOCK_FILE_NAME)
+        self.snapshot_file = os.path.join(qdata_dir, SNAPSHOT_FILE_NAME)
+        self.wal_file = os.path.join(qdata_dir, WAL_FILE_NAME)
+        self.jobs = {}  # In-memory dictionary of jobs: {id: job_dict}
+
+        self._init_qdata_dir()
+        self._load_state()
+
+    def _init_qdata_dir(self):
+        """Creates the QDATA_DIR if it doesn't exist."""
+        # Ensure parent directory entry is durable if QDATA_DIR is new
+        parent_dir = os.path.dirname(self.qdata_dir)
+        if not parent_dir: # e.g., if .qdata is in current dir
+            parent_dir = os.getcwd()
+
+        os.makedirs(self.qdata_dir, exist_ok=True)
+        _fsync_dir(parent_dir) # fsync parent to ensure QDATA_DIR entry is durable
+        _fsync_dir(self.qdata_dir) # fsync QDATA_DIR itself
+
+    def _load_state(self):
+        """
+        Loads the job state from snapshot.json and replays wal.log.
+        Performs an implicit compact if recovery is needed.
+        This method is called once at initialization *without* an explicit lock
+        on the `self.lock_file` because it's the first operation and needs to
+        handle potential stale locks from crashed processes.
+        However, any disk writes it triggers (via _compact_internal) will acquire locks.
+        """
+        recovery_needed = False
+        temp_jobs = {} # Use a temporary dict for loading to avoid corrupting self.jobs if snapshot is bad
+
+        # 1. Load from snapshot.json
+        if os.path.exists(self.snapshot_file):
+            try:
+                with open(self.snapshot_file, 'r') as f:
+                    snapshot_jobs = json.load(f)
+                    if not isinstance(snapshot_jobs, list):
+                        raise json.JSONDecodeError("Snapshot root is not a list", self.snapshot_file, 0)
+                    for job in snapshot_jobs:
+                        if 'id' in job:
+                            temp_jobs[job['id']] = job
+                        else:
+                            _eprint(f"Warning: Job in snapshot missing 'id': {job}. Skipping.")
+                            recovery_needed = True
+            except (json.JSONDecodeError, IOError) as e:
+                _eprint(f"Warning: Could not read or parse snapshot file {self.snapshot_file}: {e}. Attempting recovery from WAL.")
+                temp_jobs = {} # Clear potentially corrupted state
+                recovery_needed = True
+        else:
+            recovery_needed = True # Snapshot missing
+
+        # 2. Replay wal.log
+        if os.path.exists(self.wal_file):
+            try:
+                with open(self.wal_file, 'r') as f:
+                    for line_num, line in enumerate(f, 1):
+                        try:
+                            op = json.loads(line)
+                            if op['op'] == 'add':
+                                if 'job' in op and 'id' in op['job']:
+                                    temp_jobs[op['job']['id']] = op['job']
+                                else:
+                                    _eprint(f"Warning: WAL line {line_num} missing 'job' or 'id': {line.strip()}. Skipping.")
+                                    recovery_needed = True
+                            elif op['op'] == 'update':
+                                if 'job' in op and 'id' in op['job']:
+                                    temp_jobs[op['job']['id']] = op['job']
+                                else:
+                                    _eprint(f"Warning: WAL line {line_num} missing 'job' or 'id': {line.strip()}. Skipping.")
+                                    recovery_needed = True
+                            recovery_needed = True # Any content in WAL means recovery might be needed
+                        except json.JSONDecodeError as e:
+                            _eprint(f"Warning: Corrupted line {line_num} in WAL {self.wal_file}: {line.strip()}. Error: {e}. Skipping line.")
+                            recovery_needed = True # Corrupted WAL implies recovery needed
+            except IOError as e:
+                _eprint(f"Warning: Could not read WAL file {self.wal_file}: {e}. Data might be incomplete.")
+                recovery_needed = True # WAL unreadable implies recovery needed
+        
+        self.jobs = temp_jobs # Update the actual jobs dictionary
+
+        # 3. If recovery was needed (snapshot missing/corrupt or WAL present/corrupt), perform an implicit compact.
+        # This ensures the snapshot is up-to-date and WAL is cleared.
+        if recovery_needed:
+            _eprint("Recovery needed: performing implicit compact.")
+            self._compact_internal() # This method acquires its own lock for safety
+
+    def _write_wal_entry(self, op_type, job_data=None, job_id=None):
+        """Appends an operation to the WAL and fsyncs."""
+        entry = {"op": op_type}
+        if job_data:
+            entry["job"] = job_data
+        if job_id:
+            entry["id"] = job_id
+
+        try:
+            with open(self.wal_file, 'a') as f:
+                f.write(json.dumps(entry) + '\n')
+                f.flush()
+                os.fsync(f.fileno())
+            _fsync_dir(self.qdata_dir) # Ensure directory entry is durable
+        except IOError as e:
+            _eprint(f"Error writing to WAL file {self.wal_file}: {e}")
+            sys.exit(5) # Critical error, cannot ensure durability
+
+    def _compact_internal(self):
+        """
+        Rewrites snapshot.json from current in-memory state and truncates wal.log.
+        This method *must* be called within a lock.
+        It's internal because it doesn't print 'ok' or handle args.
+        """
+        with QLock(self.lock_file): # Acquire lock for compact operation
+            # 1. Write to a temporary snapshot file
+            temp_snapshot_file = self.snapshot_file + ".tmp"
+            try:
+                with open(temp_snapshot_file, 'w') as f:
+                    json.dump(list(self.jobs.values()), f, indent=2) # Use indent for readability
+                    f.flush()
+                    os.fsync(f.fileno()) # Ensure temp file content is durable
+            except IOError as e:
+                _eprint(f"Error writing temporary snapshot file {temp_snapshot_file}: {e}")
+                sys.exit(5) # Critical error
+
+            # 2. Atomically replace the old snapshot
+            try:
+                os.rename(temp_snapshot_file, self.snapshot_file)
+                _fsync_dir(self.qdata_dir) # Ensure directory entry is durable
+            except OSError as e:
+                _eprint(f"Error renaming snapshot file {temp_snapshot_file} to {self.snapshot_file}: {e}")
+                sys.exit(5) # Critical error
+
+            # 3. Truncate WAL file
+            try:
+                # 'w' mode truncates the file if it exists, creates it if it doesn't.
+                # This ensures the WAL is cleared.
+                with open(self.wal_file, 'w') as f:
+                    f.truncate(0) # Explicitly truncate to 0 bytes
+                    f.flush()
+                    os.fsync(f.fileno()) # Ensure WAL truncation is durable
+                _fsync_dir(self.qdata_dir) # Ensure directory entry is durable
+            except IOError as e:
+                _eprint(f"Error truncating WAL file {self.wal_file}: {e}")
+                sys.exit(5) # Critical error
+
+    def enqueue(self, payload, priority, delay, job_id, dedupe_key, max_attempts):
+        with QLock(self.lock_file):
+            now = time.time()
+            
+            # Deduplication check
+            if dedupe_key:
+                for existing_job in self.jobs.values():
+                    if existing_job.get('dedupe_key') == dedupe_key and \
+                       existing_job['status'] in [STATUS_PENDING, STATUS_CLAIMED]:
+                        print(existing_job['id'])
+                        return
+
+            # Validate ID if provided
+            if job_id:
+                if not JOB_ID_PATTERN.match(job_id):
+                    _eprint(f"Error: Invalid job ID format. Must match {JOB_ID_PATTERN.pattern}")
+                    sys.exit(2)
+                if job_id in self.jobs:
+                    _eprint(f"Error: Job with ID '{job_id}' already exists.")
+                    sys.exit(2)
+            else:
+                while True: # Generate unique ID
+                    job_id = uuid.uuid4().hex[:JOB_ID_LENGTH]
+                    if job_id not in self.jobs:
+                        break
+
+            # Validate delay
+            if delay < 0:
+                _eprint("Error: --delay must not be negative.")
+                sys.exit(2)
+
+            # Validate max_attempts
+            if max_attempts < 1:
+                _eprint("Error: --max-attempts must be >= 1.")
+                sys.exit(2)
+
+            new_job = {
+                "id": job_id,
+                "payload": payload,
+                "priority": priority,
+                "max_attempts": max_attempts,
+                "attempts": 0,
+                "status": STATUS_PENDING,
+                "created_at": now,
+                "run_at": now + delay,
+                "dedupe_key": dedupe_key,
+                "claimed_at": None,
+                "lease_expires_at": None,
+                "last_error": None,
+                "result": None,
+            }
+
+            self.jobs[job_id] = new_job
+            self._write_wal_entry("add", job_data=new_job)
+            print(job_id)
+
+    def list_jobs(self, status_filter=None):
+        with QLock(self.lock_file):
+            filtered_jobs = []
+            for job in self.jobs.values():
+                if status_filter is None or job['status'] == status_filter:
+                    filtered_jobs.append(job)
+
+            # Sort by created_at ascending, then id ascending
+            filtered_jobs.sort(key=lambda j: (j['created_at'], j['id']))
+
+            summaries = []
+            for job in filtered_jobs:
+                summaries.append({
+                    "id": job['id'],
+                    "status": job['status'],
+                    "priority": job['priority'],
+                    "attempts": job['attempts'],
+                    "created_at": job['created_at'],
+                    "run_at": job['run_at'],
+                })
+            print(json.dumps(summaries, indent=2))
+
+    def show_job(self, job_id):
+        with QLock(self.lock_file):
+            job = self.jobs.get(job_id)
+            if job is None:
+                _eprint(f"Error: job '{job_id}' not found")
+                sys.exit(4)
+            print(json.dumps(job, indent=2))
+
+    def claim_job(self, lease_seconds):
+        with QLock(self.lock_file):
+            now = time.time()
+
+            if lease_seconds <= 0:
+                _eprint("Error: --lease must be > 0.")
+                sys.exit(2)
+
+            # Sweep expired leases
+            jobs_to_update = []
+            for job_id, job in self.jobs.items():
+                if job['status'] == STATUS_CLAIMED and \
+                   job['lease_expires_at'] is not None and \
+                   job['lease_expires_at'] <= now:
+                    
+                    # Create a copy to modify, then update in self.jobs
+                    updated_job = job.copy()
+                    updated_job['status'] = STATUS_PENDING
+                    updated_job['claimed_at'] = None
+                    updated_job['lease_expires_at'] = None
+                    jobs_to_update.append(updated_job)
+            
+            for job in jobs_to_update:
+                self.jobs[job['id']] = job # Update in-memory state
+                self._write_wal_entry("update", job_data=job)
+
+            # Find candidate job
+            candidates = []
+            for job in self.jobs.values():
+                if job['status'] == STATUS_PENDING and job['run_at'] <= now:
+                    candidates.append(job)
+
+            # Order: priority descending, then created_at ascending, then id ascending
+            candidates.sort(key=lambda j: (-j['priority'], j['created_at'], j['id']))
+
+            if not candidates:
+                _eprint("Error: no jobs available")
+                sys.exit(1)
+
+            claimed_job = candidates[0].copy() # Copy to modify
+            claimed_job['status'] = STATUS_CLAIMED
+            claimed_job['claimed_at'] = now
+            claimed_job['lease_expires_at'] = now + lease_seconds
+            
+            self.jobs[claimed_job['id']] = claimed_job # Update in-memory state
+            self._write_wal_entry("update", job_data=claimed_job)
+            print(json.dumps(claimed_job, indent=2))
+
+    def complete_job(self, job_id, result):
+        with QLock(self.lock_file):
+            job = self.jobs.get(job_id)
+            if job is None:
+                _eprint(f"Error: job '{job_id}' not found")
+                sys.exit(4)
+
+            if job['status'] != STATUS_CLAIMED:
+                _eprint(f"Error: job '{job_id}' not claimed")
+                sys.exit(3)
+
+            updated_job = job.copy() # Copy to modify
+            updated_job['status'] = STATUS_DONE
+            updated_job['result'] = result
+            
+            self.jobs[job_id] = updated_job # Update in-memory state
+            self._write_wal_entry("update", job_data=updated_job)
+            print(job_id)
+
+    def fail_job(self, job_id, error_msg):
+        with QLock(self.lock_file):
+            job = self.jobs.get(job_id)
+            if job is None:
+                _eprint(f"Error: job '{job_id}' not found")
+                sys.exit(4)
+
+            if job['status'] != STATUS_CLAIMED:
+                _eprint(f"Error: job '{job_id}' not claimed")
+                sys.exit(3)
+
+            updated_job = job.copy() # Copy to modify
+            updated_job['attempts'] += 1
+            updated_job['last_error'] = error_msg
+            
+            if updated_job['attempts'] >= updated_job['max_attempts']:
+                updated_job['status'] = STATUS_DEAD
+            else:
+                updated_job['status'] = STATUS_PENDING
+                updated_job['run_at'] = time.time() + BACKOFF_BASE_SECONDS * (2**(updated_job['attempts'] - 1))
+                updated_job['claimed_at'] = None
+                updated_job['lease_expires_at'] = None
+            
+            self.jobs[job_id] = updated_job # Update in-memory state
+            self._write_wal_entry("update", job_data=updated_job)
+            print(job_id)
+
+    def get_stats(self):
+        with QLock(self.lock_file):
+            stats = {
+                STATUS_PENDING: 0,
+                STATUS_CLAIMED: 0,
+                STATUS_DONE: 0,
+                STATUS_DEAD: 0,
+                "total": 0,
+            }
+            for job in self.jobs.values():
+                stats[job['status']] = stats.get(job['status'], 0) + 1
+                stats["total"] += 1
+            print(json.dumps(stats, indent=2))
+
+    def compact(self):
+        # The _compact_internal method already handles acquiring the lock.
+        self._compact_internal()
+        print("ok")
+
+# --- Argument Parsing and Main Logic ---
+
+def main():
+    parser = argparse.ArgumentParser(description="Durable Job Queue Manager")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # Enqueue command
+    enqueue_parser = subparsers.add_parser("enqueue", help="Enqueue a new job")
+    enqueue_parser.add_argument("--payload", required=True, help="Job payload (JSON string)")
+    enqueue_parser.add_argument("--priority", type=int, default=DEFAULT_PRIORITY, help=f"Job priority (default: {DEFAULT_PRIORITY})")
+    enqueue_parser.add_argument("--delay", type=int, default=0, help="Delay before job can run, in seconds (default: 0)")
+    enqueue_parser.add_argument("--id", help=f"Custom job ID (1-64 chars, alphanumeric, _-). Auto-generated if not provided ({JOB_ID_LENGTH} hex chars).")
+    enqueue_parser.add_argument("--dedupe-key", help="Deduplication key. If a pending/claimed job with this key exists, its ID is returned instead.")
+    enqueue_parser.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS, help=f"Maximum attempts for the job (default: {DEFAULT_MAX_ATTEMPTS})")
+
+    # List command
+    list_parser = subparsers.add_parser("list", help="List jobs")
+    list_parser.add_argument("--status", choices=[STATUS_PENDING, STATUS_CLAIMED, STATUS_DONE, STATUS_DEAD], help="Filter by job status")
+
+    # Show command
+    show_parser = subparsers.add_parser("show", help="Show job details")
+    show_parser.add_argument("ID", help="Job ID")
+
+    # Claim command
+    claim_parser = subparsers.add_parser("claim", help="Claim an available job")
+    claim_parser.add_argument("--lease", type=int, default=DEFAULT_LEASE_SECONDS, help=f"Lease duration in seconds (default: {DEFAULT_LEASE_SECONDS})")
+
+    # Complete command
+    complete_parser = subparsers.add_parser("complete", help="Mark a claimed job as complete")
+    complete_parser.add_argument("ID", help="Job ID")
+    complete_parser.add_argument("--result", help="Job result (JSON string)")
+
+    # Fail command
+    fail_parser = subparsers.add_parser("fail", help="Mark a claimed job as failed")
+    fail_parser.add_argument("ID", help="Job ID")
+    fail_parser.add_argument("--error", help="Error message")
+
+    # Stats command
+    stats_parser = subparsers.add_parser("stats", help="Show queue statistics")
+
+    # Compact command
+    compact_parser = subparsers.add_parser("compact", help="Compact the queue's internal storage")
+
+    args = parser.parse_args()
+
+    qdata_dir = _get_qdata_dir()
+    
+    # Initialize JobQueue. This handles initial directory creation and state loading/recovery.
+    # The _load_state method will perform an implicit compact if needed,
+    # which will acquire its own lock.
+    try:
+        queue = JobQueue(qdata_dir)
+    except SystemExit: # Catch critical errors during initialization
+        sys.exit(5) # Use a distinct exit code for internal critical errors
+
+    try:
+        if args.command == "enqueue":
+            try:
+                payload_json = json.loads(args.payload)
+            except json.JSONDecodeError:
+                _eprint("Error: --payload must be valid JSON.")
+                sys.exit(2)
+            queue.enqueue(payload_json, args.priority, args.delay, args.id, args.dedupe_key, args.max_attempts)
+        elif args.command == "list":
+            queue.list_jobs(args.status)
+        elif args.command == "show":
+            queue.show_job(args.ID)
+        elif args.command == "claim":
+            queue.claim_job(args.lease)
+        elif args.command == "complete":
+            result_json = None
+            if args.result:
+                try:
+                    result_json = json.loads(args.result)
+                except json.JSONDecodeError:
+                    _eprint("Error: --result must be valid JSON.")
+                    sys.exit(2)
+            queue.complete_job(args.ID, result_json)
+        elif args.command == "fail":
+            queue.fail_job(args.ID, args.error)
+        elif args.command == "stats":
+            queue.get_stats()
+        elif args.command == "compact":
+            queue.compact()
+        # No else needed, argparse handles unknown commands with required=True
+    except SystemExit:
+        # Allow explicit sys.exit calls from queue methods to propagate
+        pass
+    except Exception as e:
+        _eprint(f"An unexpected error occurred: {e}")
+        sys.exit(5) # General internal error
+
+if __name__ == "__main__":
+    main()
+
+```
