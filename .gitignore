@@ -1,0 +1,7 @@
+__pycache__/
+.pytest_cache/
+.qdata/
+.junit.xml
+.solution-ref/
+evaluation/.junit.xml
+node_modules/

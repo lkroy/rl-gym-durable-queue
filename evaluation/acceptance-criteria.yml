@@ -1,0 +1,124 @@
+# Acceptance criteria: observable requirements mapped to verifier check IDs.
+# Node IDs are pytest node IDs: <test file>::<test function>.
+acceptance_criteria:
+  REQ-STATE-DIR:
+    description: State dir from $QDATA_DIR, default ./.qdata; created if missing.
+    checks:
+      - test_cli.py::test_stats_empty
+      - test_cli.py::test_default_qdata_dir
+
+  REQ-WAL:
+    description: wal.log is append-only, one {"op":"upsert","job":...} JSON object per line.
+    checks:
+      - test_core.py::test_enqueue_prints_id
+      - test_core.py::test_wal_and_snapshot_format
+      - test_recovery.py::test_compact_truncates_log
+
+  REQ-SNAPSHOT:
+    description: snapshot.json holds {"jobs": {id: job}} full state.
+    checks:
+      - test_core.py::test_wal_and_snapshot_format
+      - test_recovery.py::test_missing_snapshot_rebuilds_from_log
+      - test_recovery.py::test_compact_truncates_log
+
+  REQ-STARTUP-REPLAY:
+    description: Startup loads snapshot then replays wal.log in order; later lines win.
+    checks:
+      - test_core.py::test_claim_complete_flow
+      - test_recovery.py::test_missing_snapshot_rebuilds_from_log
+      - test_recovery.py::test_log_replay_later_wins
+
+  REQ-TORN-TAIL:
+    description: Trailing partial line (missing newline / invalid JSON) is ignored and truncated; queue stays operational.
+    checks:
+      - test_recovery.py::test_torn_tail_ignored
+
+  REQ-SNAPSHOT-RESILIENCE:
+    description: Missing or corrupt snapshot.json does not lose data; rebuilt from wal.log.
+    checks:
+      - test_recovery.py::test_missing_snapshot_rebuilds_from_log
+      - test_recovery.py::test_corrupt_snapshot_rebuilds_from_log
+
+  REQ-COMPACT:
+    description: compact rewrites snapshot from current state and truncates wal.log.
+    checks:
+      - test_recovery.py::test_compact_truncates_log
+
+  REQ-CONCURRENCY:
+    description: Concurrent processes never deliver the same job twice; mutations are atomic.
+    checks:
+      - test_concurrency.py::test_parallel_claim_no_double_delivery
+
+  REQ-JOB-FIELDS:
+    description: Job fields, types and defaults (id/payload/priority/max_attempts/attempts/status/timestamps/dedupe/lease/last_error/result).
+    checks:
+      - test_core.py::test_show_roundtrips_payload
+
+  REQ-ENQUEUE:
+    description: enqueue prints the job id, exit 0; auto id is 16 hex chars.
+    checks:
+      - test_core.py::test_enqueue_prints_id
+
+  REQ-ENQUEUE-VALIDATION:
+    description: Bad payload JSON / bad id / negative delay / max_attempts<1 / duplicate id -> exit 2.
+    checks:
+      - test_cli.py::test_bad_payload_json
+      - test_cli.py::test_bad_id
+      - test_cli.py::test_negative_delay
+      - test_cli.py::test_zero_max_attempts
+      - test_cli.py::test_duplicate_id
+
+  REQ-DEDUPE:
+    description: Same dedupe key with pending/claimed job returns existing id and creates nothing; done key does not block.
+    checks:
+      - test_dedupe.py::test_dedupe_same_key_returns_existing
+      - test_dedupe.py::test_dedupe_key_reusable_after_done
+
+  REQ-LIST:
+    description: list prints JSON array of summaries sorted created_at asc, id asc; --status filters.
+    checks:
+      - test_core.py::test_list_sorted_and_filter
+
+  REQ-SHOW:
+    description: show prints full job JSON; unknown id -> stderr contains "job not found", exit 4.
+    checks:
+      - test_core.py::test_show_roundtrips_payload
+      - test_cli.py::test_show_unknown
+
+  REQ-CLAIM:
+    description: claim sweeps expired leases first; candidates pending && run_at<=now; order priority desc, created_at asc, id asc; sets claimed_at/lease_expires_at; prints full job JSON; none -> "no jobs available", exit 1; lease<=0 -> exit 2.
+    checks:
+      - test_core.py::test_claim_complete_flow
+      - test_scheduling.py::test_priority_order
+      - test_scheduling.py::test_fifo_tiebreak
+      - test_scheduling.py::test_delayed_job_not_claimable
+      - test_cli.py::test_claim_empty
+      - test_cli.py::test_zero_lease
+      - test_lease.py::test_lease_expiry_reclaim
+
+  REQ-COMPLETE:
+    description: complete requires claimed (else "not claimed", exit 3); unknown -> exit 4; bad result JSON -> exit 2; sets done + result.
+    checks:
+      - test_core.py::test_claim_complete_flow
+      - test_cli.py::test_complete_pending_conflict
+
+  REQ-FAIL:
+    description: fail requires claimed (else exit 3); unknown -> exit 4; attempts+=1; attempts>=max_attempts -> dead else pending with run_at=now+10*2**(attempts-1), lease cleared, last_error set.
+    checks:
+      - test_retries.py::test_fail_backoff_requeue
+      - test_retries.py::test_fail_dead_after_max_attempts
+      - test_retries.py::test_fail_pending_conflict
+
+  REQ-STATS:
+    description: stats prints pending/claimed/done/dead/total counts, exit 0.
+    checks:
+      - test_core.py::test_stats_counts
+      - test_cli.py::test_stats_empty
+
+  REQ-EXIT-CODES:
+    description: 0 ok / 1 no jobs / 2 usage-validation / 3 state conflict / 4 not found; unknown command -> 2.
+    checks:
+      - test_cli.py::test_unknown_command
+      - test_cli.py::test_claim_empty
+      - test_cli.py::test_complete_pending_conflict
+      - test_cli.py::test_show_unknown

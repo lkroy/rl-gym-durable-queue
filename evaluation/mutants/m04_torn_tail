@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""q - a durable, crash-safe job queue CLI (reference implementation).
+
+Standard library only. All state lives under $QDATA_DIR (default ./.qdata).
+
+Every command conceptually: lock, load (snapshot + WAL replay + torn-tail
+truncation), sweep expired leases, execute, append WAL (fsync), rewrite the
+snapshot atomically (tmp + fsync + rename), unlock.
+"""
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import secrets
+import sys
+import time
+
+ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+STATUSES = ("pending", "claimed", "done", "dead")
+
+
+def die(msg, code):
+    sys.stderr.write(str(msg) + "\n")
+    sys.exit(code)
+
+
+def data_dir():
+    return os.environ.get("QDATA_DIR", "./.qdata")
+
+
+def utcnow():
+    return time.time()
+
+
+# ------------------------------------------------------------- persistence ---
+
+def _acquire_lock(dirpath):
+    os.makedirs(dirpath, exist_ok=True)
+    fh = open(os.path.join(dirpath, ".lock"), "a")
+    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+    return fh
+
+
+def _fsync_dir(dirpath):
+    try:
+        fd = os.open(dirpath, os.O_DIRECTORY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _truncate_torn_tail(path):
+    return False  # BUG: torn tail not handled
+
+
+def _load_snapshot(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+    jobs = obj.get("jobs") if isinstance(obj, dict) else None
+    if not isinstance(jobs, dict):
+        return {}
+    clean = {}
+    for key, val in jobs.items():
+        if isinstance(val, dict) and val.get("id") == key:
+            clean[key] = val
+    return clean
+
+
+def _load_wal(path):
+    _truncate_torn_tail(path)
+    jobs = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                job = json.loads(line)["job"]
+                jobs[job["id"]] = job
+    except FileNotFoundError:
+        pass
+    return jobs
+
+
+def load_state(dirpath):
+    jobs = _load_snapshot(os.path.join(dirpath, "snapshot.json"))
+    jobs.update(_load_wal(os.path.join(dirpath, "wal.log")))
+    return jobs
+
+
+def append_wal(dirpath, jobs):
+    jobs = list(jobs)
+    if not jobs:
+        return
+    path = os.path.join(dirpath, "wal.log")
+    with open(path, "a", encoding="utf-8") as f:
+        for job in jobs:
+            f.write(json.dumps({"op": "upsert", "job": job},
+                               separators=(",", ":")) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    _fsync_dir(dirpath)
+
+
+def write_snapshot(dirpath, jobs):
+    path = os.path.join(dirpath, "snapshot.json")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"jobs": jobs}, f, separators=(",", ":"))
+        f.flush()
+        os.fsync(f.fileno())
+    os.rename(tmp, path)
+    _fsync_dir(dirpath)
+
+
+def truncate_wal(dirpath):
+    path = os.path.join(dirpath, "wal.log")
+    with open(path, "w", encoding="utf-8") as f:
+        f.flush()
+        os.fsync(f.fileno())
+    _fsync_dir(dirpath)
+
+
+# ------------------------------------------------------------------ logic ---
+
+def sweep_expired(jobs, t):
+    """Return claimed jobs whose lease expired back to pending. Ids changed."""
+    changed = []
+    for job in jobs.values():
+        if (job["status"] == "claimed"
+                and job.get("lease_expires_at") is not None
+                and job["lease_expires_at"] <= t):
+            job["status"] = "pending"
+            job["claimed_at"] = None
+            job["lease_expires_at"] = None
+            changed.append(job["id"])
+    return changed
+
+
+def _new_id(jobs):
+    while True:
+        jid = secrets.token_hex(8)
+        if jid not in jobs:
+            return jid
+
+
+def _find_dedupe(jobs, key):
+    for job in jobs.values():
+        if job.get("dedupe_key") == key and job["status"] in ("pending", "claimed"):
+            return job
+    return None
+
+
+def _get_job_or_die(jobs, jid):
+    job = jobs.get(jid)
+    if job is None:
+        die("job not found: %s" % jid, 4)
+    return job
+
+
+def summarize(job):
+    return {"id": job["id"], "status": job["status"],
+            "priority": job["priority"], "attempts": job["attempts"],
+            "created_at": job["created_at"], "run_at": job["run_at"]}
+
+
+def cmd_enqueue(args, jobs, t, dirty, ctx):
+    try:
+        payload = json.loads(args.payload)
+    except ValueError:
+        die("invalid payload: not valid JSON", 2)
+    if args.id is not None:
+        if not ID_RE.match(args.id):
+            die("invalid id: must match ^[A-Za-z0-9_-]{1,64}$", 2)
+        if args.id in jobs:
+            die("duplicate id: %s" % args.id, 2)
+        jid = args.id
+    else:
+        jid = _new_id(jobs)
+    if args.delay < 0:
+        die("delay must be >= 0", 2)
+    if args.max_attempts < 1:
+        die("max_attempts must be >= 1", 2)
+    if args.dedupe_key is not None:
+        hit = _find_dedupe(jobs, args.dedupe_key)
+        if hit is not None:
+            sys.stdout.write(hit["id"] + "\n")
+            return 0
+    job = {
+        "id": jid,
+        "payload": payload,
+        "priority": args.priority,
+        "max_attempts": args.max_attempts,
+        "attempts": 0,
+        "status": "pending",
+        "created_at": t,
+        "run_at": t + args.delay,
+        "dedupe_key": args.dedupe_key,
+        "claimed_at": None,
+        "lease_expires_at": None,
+        "last_error": None,
+        "result": None,
+    }
+    jobs[jid] = job
+    dirty.add(jid)
+    sys.stdout.write(jid + "\n")
+    return 0
+
+
+def cmd_list(args, jobs, t, dirty, ctx):
+    rows = [summarize(j) for j in jobs.values()]
+    if args.status is not None:
+        rows = [r for r in rows if r["status"] == args.status]
+    rows.sort(key=lambda r: (r["created_at"], r["id"]))
+    sys.stdout.write(json.dumps(rows) + "\n")
+    return 0
+
+
+def cmd_show(args, jobs, t, dirty, ctx):
+    job = _get_job_or_die(jobs, args.id)
+    sys.stdout.write(json.dumps(job) + "\n")
+    return 0
+
+
+def cmd_claim(args, jobs, t, dirty, ctx):
+    if args.lease <= 0:
+        die("lease must be > 0", 2)
+    cands = [j for j in jobs.values()
+             if j["status"] == "pending" and j["run_at"] <= t]
+    cands.sort(key=lambda j: (-j["priority"], j["created_at"], j["id"]))
+    if not cands:
+        die("no jobs available", 1)
+    job = cands[0]
+    job["status"] = "claimed"
+    job["claimed_at"] = t
+    job["lease_expires_at"] = t + args.lease
+    dirty.add(job["id"])
+    sys.stdout.write(json.dumps(job) + "\n")
+    return 0
+
+
+def cmd_complete(args, jobs, t, dirty, ctx):
+    job = _get_job_or_die(jobs, args.id)
+    if job["status"] != "claimed":
+        die("job not claimed", 3)  # REQ-CLAIMED-COMPLETE
+    result = None
+    if args.result is not None:
+        try:
+            result = json.loads(args.result)
+        except ValueError:
+            die("invalid result: not valid JSON", 2)
+    job["status"] = "done"
+    job["result"] = result
+    dirty.add(job["id"])
+    sys.stdout.write(job["id"] + "\n")
+    return 0
+
+
+def cmd_fail(args, jobs, t, dirty, ctx):
+    job = _get_job_or_die(jobs, args.id)
+    if job["status"] != "claimed":
+        die("job not claimed", 3)  # REQ-CLAIMED-FAIL
+    job["attempts"] += 1
+    if job["attempts"] >= job["max_attempts"]:
+        job["status"] = "dead"
+    else:
+        job["status"] = "pending"
+        job["run_at"] = t + 10 * 2 ** (job["attempts"] - 1)
+    job["claimed_at"] = None
+    job["lease_expires_at"] = None
+    job["last_error"] = args.error
+    dirty.add(job["id"])
+    sys.stdout.write(job["id"] + "\n")
+    return 0
+
+
+def cmd_stats(args, jobs, t, dirty, ctx):
+    counts = {"pending": 0, "claimed": 0, "done": 0, "dead": 0}
+    for job in jobs.values():
+        if job["status"] in counts:
+            counts[job["status"]] += 1
+    counts["total"] = sum(counts.values())
+    sys.stdout.write(json.dumps(counts) + "\n")
+    return 0
+
+
+def cmd_compact(args, jobs, t, dirty, ctx):
+    ctx["compact"] = True
+    sys.stdout.write("ok\n")
+    return 0
+
+
+COMMANDS = {
+    "enqueue": cmd_enqueue,
+    "list": cmd_list,
+    "show": cmd_show,
+    "claim": cmd_claim,
+    "complete": cmd_complete,
+    "fail": cmd_fail,
+    "stats": cmd_stats,
+    "compact": cmd_compact,
+}
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(prog="q", allow_abbrev=False)
+    sub = p.add_subparsers(dest="cmd")
+    e = sub.add_parser("enqueue", allow_abbrev=False)
+    e.add_argument("--payload", required=True)
+    e.add_argument("--priority", type=int, default=0)
+    e.add_argument("--delay", type=float, default=0.0)
+    e.add_argument("--id", default=None)
+    e.add_argument("--dedupe-key", default=None)
+    e.add_argument("--max-attempts", type=int, default=3)
+    li = sub.add_parser("list", allow_abbrev=False)
+    li.add_argument("--status", choices=list(STATUSES), default=None)
+    sh = sub.add_parser("show", allow_abbrev=False)
+    sh.add_argument("id")
+    cl = sub.add_parser("claim", allow_abbrev=False)
+    cl.add_argument("--lease", type=float, default=60.0)
+    co = sub.add_parser("complete", allow_abbrev=False)
+    co.add_argument("id")
+    co.add_argument("--result", default=None)
+    fa = sub.add_parser("fail", allow_abbrev=False)
+    fa.add_argument("id")
+    fa.add_argument("--error", default=None)
+    sub.add_parser("stats", allow_abbrev=False)
+    sub.add_parser("compact", allow_abbrev=False)
+    args = p.parse_args(argv)
+    if args.cmd is None:
+        p.error("unknown command")
+    return args
+
+
+def main(argv):
+    args = parse_args(argv)
+    dirpath = data_dir()
+    lockfh = _acquire_lock(dirpath)
+    try:
+        t = utcnow()
+        jobs = load_state(dirpath)
+        dirty = set(sweep_expired(jobs, t))
+        ctx = {}
+        code = COMMANDS[args.cmd](args, jobs, t, dirty, ctx)
+        if ctx.get("compact"):
+            write_snapshot(dirpath, jobs)
+            truncate_wal(dirpath)
+        elif dirty:
+            append_wal(dirpath, [jobs[jid] for jid in sorted(dirty)
+                                 if jid in jobs])
+            write_snapshot(dirpath, jobs)
+        return code
+    finally:
+        lockfh.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
