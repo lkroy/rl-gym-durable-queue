@@ -1,0 +1,20 @@
+# Weighted scoring for the durable-queue RL Gym task.
+# Weights MUST sum to exactly 1.0 (asserted by evaluation/score.py).
+weights:
+  core: 0.30
+  scheduling: 0.20
+  retries: 0.15
+  dedupe: 0.10
+  lease: 0.10
+  recovery: 0.10
+  cli: 0.05
+
+# Each category maps to the pytest file whose checks it owns.
+files:
+  core: test_core.py
+  scheduling: test_scheduling.py
+  retries: test_retries.py
+  dedupe: test_dedupe.py
+  lease: test_lease.py
+  recovery: test_recovery.py
+  cli: test_cli.py

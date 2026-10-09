@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Starter stub. Replace this file with your implementation.
+echo "not implemented" >&2
+exit 1

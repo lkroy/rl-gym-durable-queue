@@ -1,0 +1,1 @@
+{"description":"RL Gym task: durable crash-safe job queue CLI for coding agents","name":"rl-gym-durable-queue","private":true,"scripts":{"check:mutants":"python3 evaluation/check_mutants.py","check:reference":"bash scripts/check_reference.sh","generate":"bash scripts/generate.sh","score":"python3 evaluation/score.py"},"version":"0.1.0"}

@@ -1,0 +1,42 @@
+mutants:
+  m01_priority:
+    bug: claim orders by created_at only, ignoring priority
+    file: m01_priority
+    must_fail:
+    - test_scheduling.py::test_priority_order
+  m02_backoff:
+    bug: fail sets run_at=now (no exponential backoff)
+    file: m02_backoff
+    must_fail:
+    - test_retries.py::test_fail_backoff_requeue
+  m03_dedupe:
+    bug: enqueue ignores --dedupe-key (always creates a new job)
+    file: m03_dedupe
+    must_fail:
+    - test_dedupe.py::test_dedupe_same_key_returns_existing
+  m04_torn_tail:
+    bug: WAL torn tail never truncated (crash/traceback on corrupt tail)
+    file: m04_torn_tail
+    must_fail:
+    - test_recovery.py::test_torn_tail_ignored
+  m05_lease:
+    bug: claim never sweeps expired leases
+    file: m05_lease
+    must_fail:
+    - test_lease.py::test_lease_expiry_reclaim
+    - test_lease.py::test_complete_after_lease_expiry_fails
+  m06_complete:
+    bug: complete() allows completing a non-claimed job
+    file: m06_complete
+    must_fail:
+    - test_cli.py::test_complete_pending_conflict
+  m07_delay:
+    bug: claim ignores run_at (delayed jobs become claimable at once)
+    file: m07_delay
+    must_fail:
+    - test_scheduling.py::test_delayed_job_not_claimable
+  m08_compact:
+    bug: compact rewrites the snapshot but never truncates wal.log
+    file: m08_compact
+    must_fail:
+    - test_recovery.py::test_compact_truncates_log
