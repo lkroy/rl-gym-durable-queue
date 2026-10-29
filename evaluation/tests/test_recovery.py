@@ -41,28 +41,72 @@ def _payload(i):
 
 
 def test_kill_mid_enqueue_never_corrupts(q):
-    for i in range(5):
+    # 25 base jobs with large payloads so every later write phase is long.
+    for i in range(25):
         cp = q.run("enqueue", "--payload", _payload(i),
                    "--id", "base-%d" % i)
         assert cp.returncode == 0, cp.stderr
-    prev = 5
-    rng = random.Random(20261009)
-    for trial in range(40):
-        p = _spawn(q, "enqueue", "--payload", _payload(trial),
-                   "--id", "k-%d" % trial)
-        time.sleep(rng.uniform(0.0005, 0.004))
-        p.kill()  # SIGKILL
-        p.wait()
+    prev = 25
+    for trial in range(25):
+        # Staggered burst: 4 enqueues launched 5ms apart widen the window in
+        # which a SIGKILL lands mid-write; kill every survivor afterwards.
+        procs = []
+        for k in range(4):
+            procs.append(_spawn(q, "enqueue",
+                                "--payload", _payload(1000 + trial * 4 + k),
+                                "--id", "k%d-%d" % (trial, k)))
+            time.sleep(0.005)
+        time.sleep(0.003)
+        for p in procs:
+            if p.poll() is None:  # skip processes that already exited
+                p.kill()  # SIGKILL
+        for p in procs:
+            p.wait()
         cp = q.run("stats")
         assert cp.returncode == 0, \
             "queue unusable after SIGKILL mid-enqueue (trial %d): %r" % (
                 trial, cp.stderr)
         total = json.loads(cp.stdout)["total"]
-        assert total in (prev, prev + 1), \
+        assert prev <= total <= prev + 4, \
             "acknowledged jobs lost or duplicated: %d -> %d" % (prev, total)
         prev = total
     ids = {r["id"] for r in q.json("list")}
-    assert {"base-%d" % i for i in range(5)} <= ids
+    assert {"base-%d" % i for i in range(25)} <= ids
+
+
+def test_torn_append_recovers(q):
+    # A crash can cut a write at any byte. For EVERY regular file under
+    # $QDATA_DIR (layout-agnostic via os.walk): copy the state dir, append a
+    # partial trailing record with no terminating newline to that file's
+    # copy, and require the next command to exit 0 with every acknowledged
+    # job intact.
+    for i in range(5):
+        cp = q.run("enqueue", "--payload", json.dumps({"n": i}),
+                   "--id", "t-%d" % i)
+        assert cp.returncode == 0, cp.stderr
+    want = {"t-%d" % i for i in range(5)}
+    targets = []
+    for root, _dirs, files in os.walk(q.qdata):
+        for f in files:
+            p = os.path.join(root, f)
+            if os.path.isfile(p) and not os.path.islink(p):
+                targets.append(os.path.relpath(p, q.qdata))
+    assert targets, "expected state files under $QDATA_DIR"
+    for rel in targets:
+        alt = q.qdata + "-torn"
+        shutil.rmtree(alt, ignore_errors=True)
+        shutil.copytree(q.qdata, alt)
+        with open(os.path.join(alt, rel), "ab") as fh:
+            fh.write(b'\n{"partial_write": true')  # torn: no newline
+        env = dict(os.environ, QDATA_DIR=alt)
+        cp = subprocess.run([q.q_bin, "list"], capture_output=True,
+                            text=True, env=env, timeout=60)
+        assert cp.returncode == 0, \
+            "q list failed after torn append to %s: %r" % (rel, cp.stderr)
+        rows = json.loads(cp.stdout)
+        assert {r["id"] for r in rows} == want, \
+            "acknowledged jobs lost after torn append to %s" % rel
+        shutil.rmtree(alt, ignore_errors=True)
 
 
 def test_kill_mid_compact_never_loses_jobs(q):
@@ -89,11 +133,15 @@ def test_delete_any_single_file_preserves_jobs(q):
         cp = q.run("enqueue", "--payload", json.dumps({"n": i}),
                    "--id", "d-%d" % i)
         assert cp.returncode == 0, cp.stderr
-    files = sorted(
-        f for f in os.listdir(q.qdata)
-        if os.path.isfile(os.path.join(q.qdata, f)))
-    assert files, "expected state files under $QDATA_DIR"
-    for victim in files:
+    victims = []
+    for root, _dirs, files in os.walk(q.qdata):
+        for f in files:
+            p = os.path.join(root, f)
+            if os.path.isfile(p) and not os.path.islink(p):
+                victims.append(os.path.relpath(p, q.qdata))
+    victims = sorted(victims)
+    assert victims, "expected state files under $QDATA_DIR"
+    for victim in victims:
         alt = q.qdata + "-copy"
         shutil.rmtree(alt, ignore_errors=True)
         shutil.copytree(q.qdata, alt)

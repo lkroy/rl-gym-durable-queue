@@ -35,7 +35,8 @@ class Q:
 
 @pytest.fixture
 def q_bin():
-    return os.environ.get("Q_BIN", os.path.join(REPO_ROOT, "reference", "q"))
+    return os.path.abspath(
+        os.environ.get("Q_BIN", os.path.join(REPO_ROOT, "reference", "q")))
 
 
 @pytest.fixture

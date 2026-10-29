@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the 8 mutant copies of reference/q (one realistic bug each).
+"""Generate the 11 mutant copies of reference/q (one realistic bug each).
 
 Run from the repo root: python3 evaluation/mutants/make_mutants.py
 Idempotent: rewrites evaluation/mutants/m0* and mutants.yml.
@@ -76,13 +76,8 @@ mutant("m04_single_copy",
                'def load_state(dirpath):\n'
                '    # BUG: single copy of state; nothing to rebuild from\n'
                '    return _load_snapshot(os.path.join(dirpath, "snapshot.json"))'),
-           '        elif dirty:\n'
-           '            append_wal(dirpath, [jobs[jid] for jid in sorted(dirty)\n'
-           '                                 if jid in jobs])\n'
-           '            write_snapshot(dirpath, jobs)',
-           '        elif dirty:\n'
-           '            # BUG: snapshot is the only durable copy\n'
-           '            write_snapshot(dirpath, jobs)'))
+           '            append_ops(dirpath, ops)\n',
+           '            # BUG: snapshot is the only durable copy (WAL skipped)\n'))
 
 # 5. expired leases never swept
 mutant("m05_lease",
@@ -122,14 +117,50 @@ mutant("m08_compact",
        lambda s: sub_once(
            s,
            '        if ctx.get("compact"):\n'
-           '            write_snapshot(dirpath, jobs)\n'
+           '            write_snapshot(dirpath, jobs, idem)\n'
            '            truncate_wal(dirpath)',
            '        if ctx.get("compact"):\n'
            '            # BUG: compact archives away non-pending jobs\n'
            '            write_snapshot(dirpath, {jid: j\n'
            '                                     for jid, j in jobs.items()\n'
-           '                                     if j["status"] == "pending"})\n'
+           '                                     if j["status"] == "pending"},\n'
+           '                             idem)\n'
            '            truncate_wal(dirpath)'))
+
+
+# 9. no inter-process locking: concurrent claims can double-deliver
+mutant("m09_nolock",
+       "lock file opened but never locked; concurrent mutations race",
+       ["test_concurrency.py::test_parallel_claim_no_double_delivery"],
+       lambda s: replace_function(
+           s, "_acquire_lock",
+           "def _acquire_lock(dirpath):\n"
+           "    os.makedirs(dirpath, exist_ok=True)\n"
+           "    # BUG: lock file opened but never locked\n"
+           "    return open(os.path.join(dirpath, \".lock\"), \"a\")\n\n"))
+
+# 10. torn WAL tails never repaired: a partial write crashes the next command
+mutant("m10_no_torn_repair",
+       "_truncate_torn_tail neutered; a torn trailing record is replayed "
+       "and crashes the next command instead of being discarded",
+       ["test_recovery.py::test_torn_append_recovers"],
+       lambda s: replace_function(
+           s, "_truncate_torn_tail",
+           "def _truncate_torn_tail(path):\n"
+           "    return False  # BUG: torn tails never repaired\n\n"))
+
+# 11. dead-lettering disabled: fail() always requeues, never marks dead
+mutant("m11_no_dead_letter",
+       "fail() never sets status dead; jobs retry forever",
+       ["test_retries.py::test_fail_dead_after_max_attempts"],
+       lambda s: sub_once(
+           s,
+           "    if job[\"attempts\"] >= job[\"max_attempts\"]:\n"
+           "        job[\"status\"] = \"dead\"\n"
+           "    else:",
+           "    if False:  # BUG: dead-lettering disabled\n"
+           "        job[\"status\"] = \"dead\"\n"
+           "    else:"))
 
 
 def main():

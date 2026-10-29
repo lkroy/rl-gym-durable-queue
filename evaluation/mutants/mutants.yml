@@ -41,3 +41,19 @@ mutants:
     file: m08_compact
     must_fail:
     - test_recovery.py::test_compact_reclaims_disk_space
+  m09_nolock:
+    bug: lock file opened but never locked; concurrent mutations race
+    file: m09_nolock
+    must_fail:
+    - test_concurrency.py::test_parallel_claim_no_double_delivery
+  m10_no_torn_repair:
+    bug: _truncate_torn_tail neutered; a torn trailing record is replayed and crashes
+      the next command instead of being discarded
+    file: m10_no_torn_repair
+    must_fail:
+    - test_recovery.py::test_torn_append_recovers
+  m11_no_dead_letter:
+    bug: fail() never sets status dead; jobs retry forever
+    file: m11_no_dead_letter
+    must_fail:
+    - test_retries.py::test_fail_dead_after_max_attempts

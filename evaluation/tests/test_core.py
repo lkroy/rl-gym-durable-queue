@@ -74,10 +74,15 @@ def test_state_persisted_to_disk(q):
     import os
     cp = q.run("enqueue", "--payload", '{"a":1}', "--id", "persist1")
     assert cp.returncode == 0, cp.stderr
-    files = [f for f in os.listdir(q.qdata)
-             if os.path.isfile(os.path.join(q.qdata, f))]
-    assert files, "expected state files under $QDATA_DIR after enqueue"
-    total = sum(os.path.getsize(os.path.join(q.qdata, f)) for f in files)
-    assert total > 0, "state files are empty"
+    # Layout-agnostic: the storage layout is the solution's choice, so walk
+    # the whole tree and pass if ANY non-empty regular file exists anywhere
+    # under $QDATA_DIR.
+    found = False
+    for root, _dirs, files in os.walk(q.qdata):
+        for f in files:
+            p = os.path.join(root, f)
+            if os.path.isfile(p) and os.path.getsize(p) > 0:
+                found = True
+    assert found, "expected a non-empty state file under $QDATA_DIR"
     # a fresh process sees the same job (durability across processes)
     assert q.json("show", "persist1")["payload"] == {"a": 1}

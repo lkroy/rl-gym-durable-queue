@@ -27,10 +27,14 @@ these guarantees hold observably:
   intact; the interrupted operation itself MUST have taken effect at most
   once (it may have fully completed or not at all — never partially, never
   duplicated).
-- Redundancy: while no `q` process is running, the verifier WILL delete a
-  single file inside `$QDATA_DIR` — any one it chooses. Afterwards every
-  acknowledged job MUST still be intact and the queue fully operational.
-  Design your storage so that no single file is a single point of failure.
+- Redundancy: the queue must keep every acknowledged job intact and remain
+  fully operational even if any single file under the state directory is
+  lost while no `q` process is running. Design your storage so that no
+  single file is a single point of failure.
+- Partial writes: a crash can interrupt a write at any byte, leaving a
+  state file with a partially-written trailing record. The next command
+  MUST recover from this automatically — discarding the partial data,
+  keeping every acknowledged job intact, and exiting 0.
 - `q compact` MUST preserve every job, whatever its status, and MUST reduce
   the total bytes stored under `$QDATA_DIR` once the queue has grown through
   many operations (it is the mechanism that reclaims space from the
@@ -81,6 +85,25 @@ print a message to stderr.
     create nothing. A key whose previous job is `done` (or `dead`) does NOT
     block a new enqueue.
 
+- `q enqueue-batch --jobs '<json-array>'`
+  - Enqueue many jobs atomically: either ALL of them are created or NONE
+    is. `--jobs` MUST be a JSON array, otherwise exit 2.
+  - Each element is an object with `payload` (required, any JSON) and
+    optional `priority`, `delay`, `id`, `dedupe_key`, `max_attempts`
+    (same meanings and validation as `enqueue`). Validate EVERY element
+    before creating anything: any invalid element (bad JSON types, bad
+    `id` format, duplicate `id` within the batch or against existing
+    jobs, negative `delay`, `max_attempts` < 1, missing `payload`)
+    aborts the whole batch with exit 2 and creates NOTHING.
+  - Dedupe is resolved per element as in `enqueue`: an element whose
+    `dedupe_key` matches a `pending`/`claimed` job — including an earlier
+    element of the same batch — resolves to that job's id instead of
+    creating a duplicate. Dedupe hits do NOT abort the batch.
+  - Crash atomicity applies to the batch as a whole: a process killed
+    (SIGKILL) in the middle of `enqueue-batch` MUST leave either all of
+    the batch's jobs or none of them — never a partial batch.
+  - On success: print a JSON array of the job ids (in input order), exit 0.
+
 - `q list [--status S]`
   - Print a JSON array of summaries, one per job:
     `{"id","status","priority","attempts","created_at","run_at"}`.
@@ -91,11 +114,25 @@ print a message to stderr.
   - Print the full job object as JSON, exit 0.
   - Unknown id: stderr MUST contain `job not found`, exit 4.
 
-- `q claim [--lease SEC]` (default 60)
+- `q claim [--lease SEC] [--idempotency-key KEY]` (default 60)
   - `--lease` MUST be > 0, otherwise exit 2.
+  - `--idempotency-key`, when given, MUST match `^[A-Za-z0-9_-]{1,64}$`,
+    otherwise exit 2.
   - First, sweep expired leases: any job with status `claimed` and
     `lease_expires_at <= now` returns to `pending`, with `claimed_at` and
-    `lease_expires_at` cleared.
+    `lease_expires_at` cleared. Idempotency mappings whose lease has
+    expired are discarded in the same sweep.
+  - If KEY is given and maps to a job that is currently `claimed` with an
+    unexpired lease, return THAT job (full JSON), exit 0. Do NOT claim a
+    new job and do NOT extend the lease. This gives exactly-once delivery
+    across client retries and crashes.
+  - Otherwise claim the best candidate as usual; if a candidate is
+    claimed, record KEY as mapped to it (replacing any stale mapping).
+    Mappings for jobs that become `done` or `dead` are discarded, so a
+    later claim with the same KEY starts fresh.
+  - The mapping MUST be durable (survive crashes) and MUST be safe under
+    concurrency: two processes claiming at the same time with the same
+    KEY MUST receive the same job, never two different jobs.
   - Candidates: status `pending` AND `run_at <= now`.
   - Order: `priority` descending, then `created_at` ascending, then `id`
     ascending. Claim the first candidate: set status `claimed`,
@@ -124,8 +161,9 @@ print a message to stderr.
   - Print `{"pending":n,"claimed":n,"done":n,"dead":n,"total":n}`, exit 0.
 
 - `q compact`
-  - Rewrite `snapshot.json` from current state and truncate `wal.log`.
-    Print `ok`, exit 0.
+  - Reclaim space used by the redundant storage: rewrite the durable state
+    in compacted form so that the total bytes stored under `$QDATA_DIR`
+    shrink. Print `ok`, exit 0.
 
 - Any unknown command: exit 2.
 

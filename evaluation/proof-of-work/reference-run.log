@@ -1,16 +1,19 @@
 {
   "score": 1.0,
   "categories": {
+    "batch": 1.0,
     "cli": 1.0,
+    "concurrency": 1.0,
     "core": 1.0,
     "dedupe": 1.0,
+    "idempotency": 1.0,
     "lease": 1.0,
     "recovery": 1.0,
     "retries": 1.0,
     "scheduling": 1.0
   },
   "failed": [],
-  "passed": 33,
-  "total": 33,
+  "passed": 44,
+  "total": 44,
   "q_bin": "/home/hatch/workspace/rl-gym-durable-queue/.solution-ref/q"
 }
