@@ -1,4 +1,55 @@
-#!/usr/bin/env bash
-# Starter stub. Replace this file with your implementation.
-echo "not implemented" >&2
-exit 1
+#!/usr/bin/env python3
+"""Starter stub for the durable job queue task.
+
+Implements the full command-line surface (argparse) but none of the
+behavior: every command exits 1 with "not implemented". Replace this
+file with your implementation.
+"""
+import argparse
+import sys
+
+STATUSES = ("pending", "claimed", "done", "dead")
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(prog="q", allow_abbrev=False)
+    sub = p.add_subparsers(dest="cmd")
+    e = sub.add_parser("enqueue", allow_abbrev=False)
+    e.add_argument("--payload", required=True)
+    e.add_argument("--priority", type=int, default=0)
+    e.add_argument("--delay", type=float, default=0.0)
+    e.add_argument("--id", default=None)
+    e.add_argument("--dedupe-key", default=None)
+    e.add_argument("--max-attempts", type=int, default=3)
+    b = sub.add_parser("enqueue-batch", allow_abbrev=False)
+    b.add_argument("--jobs", required=True)
+    li = sub.add_parser("list", allow_abbrev=False)
+    li.add_argument("--status", choices=list(STATUSES), default=None)
+    sh = sub.add_parser("show", allow_abbrev=False)
+    sh.add_argument("id")
+    cl = sub.add_parser("claim", allow_abbrev=False)
+    cl.add_argument("--lease", type=float, default=60.0)
+    cl.add_argument("--idempotency-key", default=None)
+    co = sub.add_parser("complete", allow_abbrev=False)
+    co.add_argument("id")
+    co.add_argument("--result", default=None)
+    fa = sub.add_parser("fail", allow_abbrev=False)
+    fa.add_argument("id")
+    fa.add_argument("--error", default=None)
+    sub.add_parser("stats", allow_abbrev=False)
+    sub.add_parser("compact", allow_abbrev=False)
+    args = p.parse_args(argv)
+    if args.cmd is None:
+        p.error("unknown command")
+    return args
+
+
+def main(argv):
+    parse_args(argv)  # validates the CLI surface only
+    sys.stderr.write("not implemented\n")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+
