@@ -4,8 +4,10 @@
 Standard library only. All state lives under $QDATA_DIR (default ./.qdata).
 
 Every command conceptually: lock, load (snapshot + WAL replay + torn-tail
-truncation), sweep expired leases, execute, append WAL (fsync), rewrite the
-snapshot atomically (tmp + fsync + rename), unlock.
+truncation), sweep expired leases (jobs and idempotency mappings), execute,
+append WAL ops in ONE fsync'd write (a batch is a single WAL record, so a
+kill mid-batch leaves all or none of its jobs), rewrite the snapshot
+atomically (tmp + fsync + rename), unlock.
 """
 
 import argparse
@@ -56,12 +58,31 @@ def _fsync_dir(dirpath):
         os.close(fd)
 
 
+def _well_formed_op(obj):
+    if not isinstance(obj, dict):
+        return False
+    op = obj.get("op")
+    if op == "upsert":
+        return (isinstance(obj.get("job"), dict)
+                and bool(obj["job"].get("id")))
+    if op == "upsert_batch":
+        jobs = obj.get("jobs")
+        return (isinstance(jobs, list)
+                and all(isinstance(j, dict) and j.get("id") for j in jobs))
+    if op == "idem":
+        return (isinstance(obj.get("key"), str)
+                and isinstance(obj.get("job_id"), str))
+    if op == "idem_del":
+        return isinstance(obj.get("key"), str)
+    return False
+
+
 def _truncate_torn_tail(path):
     """Drop a trailing partial/corrupt WAL segment. Return True if truncated.
 
     A torn tail is any trailing bytes after the last newline (a writer that
-    crashed mid-line) or a line that is not valid JSON / not a well-formed
-    upsert op. Everything from the first bad byte onward is discarded.
+    crashed mid-line) or a line that is not a well-formed op record.
+    Everything from the first bad byte onward is discarded.
     """
     try:
         with open(path, "rb") as f:
@@ -85,9 +106,7 @@ def _truncate_torn_tail(path):
         except Exception:
             good_end = off
             break
-        if not (isinstance(obj, dict) and obj.get("op") == "upsert"
-                and isinstance(obj.get("job"), dict)
-                and obj["job"].get("id")):
+        if not _well_formed_op(obj):
             good_end = off
             break
         off += len(chunk) + 1
@@ -117,6 +136,24 @@ def _load_snapshot(path):
     return clean
 
 
+def _load_idem_snapshot(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+    idem = obj.get("idem") if isinstance(obj, dict) else None
+    if not isinstance(idem, dict):
+        return {}
+    clean = {}
+    for key, val in idem.items():
+        if (isinstance(key, str) and isinstance(val, dict)
+                and isinstance(val.get("job_id"), str)):
+            clean[key] = {"job_id": val["job_id"],
+                          "lease_expires_at": val.get("lease_expires_at")}
+    return clean
+
+
 def _load_wal(path):
     _truncate_torn_tail(path)
     jobs = {}
@@ -126,11 +163,38 @@ def _load_wal(path):
                 line = line.strip()
                 if not line:
                     continue
-                job = json.loads(line)["job"]
-                jobs[job["id"]] = job
+                obj = json.loads(line)
+                if obj.get("op") == "upsert":
+                    job = obj["job"]
+                    jobs[job["id"]] = job
+                elif obj.get("op") == "upsert_batch":
+                    for job in obj["jobs"]:
+                        jobs[job["id"]] = job
+                # idem ops are replayed by _load_wal_idem
     except FileNotFoundError:
         pass
     return jobs
+
+
+def _load_wal_idem(path):
+    _truncate_torn_tail(path)
+    idem = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                if obj.get("op") == "idem":
+                    idem[obj["key"]] = {
+                        "job_id": obj["job_id"],
+                        "lease_expires_at": obj.get("lease_expires_at")}
+                elif obj.get("op") == "idem_del":
+                    idem.pop(obj["key"], None)
+    except FileNotFoundError:
+        pass
+    return idem
 
 
 def load_state(dirpath):
@@ -138,25 +202,30 @@ def load_state(dirpath):
     return _load_snapshot(os.path.join(dirpath, "snapshot.json"))
 
 
-def append_wal(dirpath, jobs):
-    jobs = list(jobs)
-    if not jobs:
+def load_idem(dirpath):
+    idem = _load_idem_snapshot(os.path.join(dirpath, "snapshot.json"))
+    idem.update(_load_wal_idem(os.path.join(dirpath, "wal.log")))
+    return idem
+
+
+def append_ops(dirpath, ops):
+    ops = list(ops)
+    if not ops:
         return
     path = os.path.join(dirpath, "wal.log")
     with open(path, "a", encoding="utf-8") as f:
-        for job in jobs:
-            f.write(json.dumps({"op": "upsert", "job": job},
-                               separators=(",", ":")) + "\n")
+        for op in ops:
+            f.write(json.dumps(op, separators=(",", ":")) + "\n")
         f.flush()
         os.fsync(f.fileno())
     _fsync_dir(dirpath)
 
 
-def write_snapshot(dirpath, jobs):
+def write_snapshot(dirpath, jobs, idem):
     path = os.path.join(dirpath, "snapshot.json")
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"jobs": jobs}, f, separators=(",", ":"))
+        json.dump({"jobs": jobs, "idem": idem}, f, separators=(",", ":"))
         f.flush()
         os.fsync(f.fileno())
     os.rename(tmp, path)
@@ -187,6 +256,25 @@ def sweep_expired(jobs, t):
     return changed
 
 
+def sweep_idem(idem, t):
+    """Discard idempotency mappings whose lease has expired. Keys discarded."""
+    discarded = []
+    for key in list(idem.keys()):
+        entry = idem[key]
+        if (entry.get("lease_expires_at") is not None
+                and entry["lease_expires_at"] <= t):
+            del idem[key]
+            discarded.append(key)
+    return discarded
+
+
+def _discard_idem_for_job(ctx, jid):
+    idem = ctx["idem"]
+    for key in [k for k, e in idem.items() if e["job_id"] == jid]:
+        del idem[key]
+        ctx["idem_ops"].append((key, None))
+
+
 def _new_id(jobs):
     while True:
         jid = secrets.token_hex(8)
@@ -214,14 +302,18 @@ def summarize(job):
             "created_at": job["created_at"], "run_at": job["run_at"]}
 
 
+def _check_id_format(jid):
+    if not ID_RE.match(jid):
+        die("invalid id: must match ^[A-Za-z0-9_-]{1,64}$", 2)
+
+
 def cmd_enqueue(args, jobs, t, dirty, ctx):
     try:
         payload = json.loads(args.payload)
     except ValueError:
         die("invalid payload: not valid JSON", 2)
     if args.id is not None:
-        if not ID_RE.match(args.id):
-            die("invalid id: must match ^[A-Za-z0-9_-]{1,64}$", 2)
+        _check_id_format(args.id)
         if args.id in jobs:
             die("duplicate id: %s" % args.id, 2)
         jid = args.id
@@ -257,6 +349,86 @@ def cmd_enqueue(args, jobs, t, dirty, ctx):
     return 0
 
 
+def _validate_batch_element(el, i, jobs, seen_ids):
+    if not isinstance(el, dict):
+        die("invalid jobs: element %d is not an object" % i, 2)
+    if "payload" not in el:
+        die("invalid jobs: element %d is missing payload" % i, 2)
+    priority = el.get("priority", 0)
+    if isinstance(priority, bool) or not isinstance(priority, int):
+        die("invalid jobs: element %d has bad priority" % i, 2)
+    delay = el.get("delay", 0)
+    if isinstance(delay, bool) or not isinstance(delay, (int, float)):
+        die("invalid jobs: element %d has bad delay" % i, 2)
+    if delay < 0:
+        die("invalid jobs: element %d has negative delay" % i, 2)
+    max_attempts = el.get("max_attempts", 3)
+    if (isinstance(max_attempts, bool)
+            or not isinstance(max_attempts, int) or max_attempts < 1):
+        die("invalid jobs: element %d has bad max_attempts" % i, 2)
+    jid = el.get("id")
+    if jid is not None:
+        if not isinstance(jid, str) or not ID_RE.match(jid):
+            die("invalid jobs: element %d has bad id" % i, 2)
+        if jid in jobs or jid in seen_ids:
+            die("invalid jobs: element %d has duplicate id" % i, 2)
+        seen_ids.add(jid)
+    dedupe_key = el.get("dedupe_key")
+    if dedupe_key is not None and not isinstance(dedupe_key, str):
+        die("invalid jobs: element %d has bad dedupe_key" % i, 2)
+    return {"payload": el["payload"], "priority": priority, "delay": delay,
+            "max_attempts": max_attempts, "id": jid,
+            "dedupe_key": dedupe_key}
+
+
+def cmd_enqueue_batch(args, jobs, t, dirty, ctx):
+    try:
+        items = json.loads(args.jobs)
+    except ValueError:
+        die("invalid jobs: not a JSON array", 2)
+    if not isinstance(items, list):
+        die("invalid jobs: not a JSON array", 2)
+    # Pass 1: validate EVERY element before creating anything.
+    seen_ids = set()
+    specs = [_validate_batch_element(el, i, jobs, seen_ids)
+             for i, el in enumerate(items)]
+    # Pass 2: create in order; dedupe resolves per element (an earlier
+    # element of this batch counts as an existing job).
+    ids = []
+    new_jobs = []
+    for spec in specs:
+        if spec["dedupe_key"] is not None:
+            hit = _find_dedupe(jobs, spec["dedupe_key"])
+            if hit is not None:
+                ids.append(hit["id"])
+                continue
+        jid = spec["id"] if spec["id"] is not None else _new_id(jobs)
+        job = {
+            "id": jid,
+            "payload": spec["payload"],
+            "priority": spec["priority"],
+            "max_attempts": spec["max_attempts"],
+            "attempts": 0,
+            "status": "pending",
+            "created_at": t,
+            "run_at": t + spec["delay"],
+            "dedupe_key": spec["dedupe_key"],
+            "claimed_at": None,
+            "lease_expires_at": None,
+            "last_error": None,
+            "result": None,
+        }
+        jobs[jid] = job
+        new_jobs.append(job)
+        ids.append(jid)
+    # The whole batch is persisted as ONE WAL record: a kill mid-batch can
+    # only leave the complete batch or a torn tail (discarded) behind.
+    if new_jobs:
+        ctx["batch"] = new_jobs
+    sys.stdout.write(json.dumps(ids) + "\n")
+    return 0
+
+
 def cmd_list(args, jobs, t, dirty, ctx):
     rows = [summarize(j) for j in jobs.values()]
     if args.status is not None:
@@ -275,6 +447,20 @@ def cmd_show(args, jobs, t, dirty, ctx):
 def cmd_claim(args, jobs, t, dirty, ctx):
     if args.lease <= 0:
         die("lease must be > 0", 2)
+    key = args.idempotency_key
+    if key is not None:
+        _check_id_format(key)
+    idem = ctx["idem"]
+    if key is not None:
+        entry = idem.get(key)
+        if entry is not None:
+            job = jobs.get(entry["job_id"])
+            if (job is not None and job["status"] == "claimed"
+                    and job.get("lease_expires_at") is not None
+                    and job["lease_expires_at"] > t):
+                sys.stdout.write(json.dumps(job) + "\n")
+                return 0
+        # stale or missing mapping: fall through to a fresh claim
     cands = [j for j in jobs.values()
              if j["status"] == "pending" and j["run_at"] <= t]
     cands.sort(key=lambda j: (-j["priority"], j["created_at"], j["id"]))
@@ -285,6 +471,11 @@ def cmd_claim(args, jobs, t, dirty, ctx):
     job["claimed_at"] = t
     job["lease_expires_at"] = t + args.lease
     dirty.add(job["id"])
+    if key is not None:
+        entry = {"job_id": job["id"],
+                 "lease_expires_at": t + args.lease}
+        idem[key] = entry
+        ctx["idem_ops"].append((key, entry))
     sys.stdout.write(json.dumps(job) + "\n")
     return 0
 
@@ -302,6 +493,7 @@ def cmd_complete(args, jobs, t, dirty, ctx):
     job["status"] = "done"
     job["result"] = result
     dirty.add(job["id"])
+    _discard_idem_for_job(ctx, job["id"])
     sys.stdout.write(job["id"] + "\n")
     return 0
 
@@ -320,6 +512,8 @@ def cmd_fail(args, jobs, t, dirty, ctx):
     job["lease_expires_at"] = None
     job["last_error"] = args.error
     dirty.add(job["id"])
+    if job["status"] == "dead":
+        _discard_idem_for_job(ctx, job["id"])
     sys.stdout.write(job["id"] + "\n")
     return 0
 
@@ -342,6 +536,7 @@ def cmd_compact(args, jobs, t, dirty, ctx):
 
 COMMANDS = {
     "enqueue": cmd_enqueue,
+    "enqueue-batch": cmd_enqueue_batch,
     "list": cmd_list,
     "show": cmd_show,
     "claim": cmd_claim,
@@ -362,12 +557,15 @@ def parse_args(argv):
     e.add_argument("--id", default=None)
     e.add_argument("--dedupe-key", default=None)
     e.add_argument("--max-attempts", type=int, default=3)
+    b = sub.add_parser("enqueue-batch", allow_abbrev=False)
+    b.add_argument("--jobs", required=True)
     li = sub.add_parser("list", allow_abbrev=False)
     li.add_argument("--status", choices=list(STATUSES), default=None)
     sh = sub.add_parser("show", allow_abbrev=False)
     sh.add_argument("id")
     cl = sub.add_parser("claim", allow_abbrev=False)
     cl.add_argument("--lease", type=float, default=60.0)
+    cl.add_argument("--idempotency-key", default=None)
     co = sub.add_parser("complete", allow_abbrev=False)
     co.add_argument("id")
     co.add_argument("--result", default=None)
@@ -389,15 +587,31 @@ def main(argv):
     try:
         t = utcnow()
         jobs = load_state(dirpath)
+        idem = load_idem(dirpath)
         dirty = set(sweep_expired(jobs, t))
-        ctx = {}
+        ctx = {"idem": idem, "idem_ops": []}
+        for key in sweep_idem(idem, t):
+            ctx["idem_ops"].append((key, None))
         code = COMMANDS[args.cmd](args, jobs, t, dirty, ctx)
         if ctx.get("compact"):
-            write_snapshot(dirpath, jobs)
+            write_snapshot(dirpath, jobs, idem)
             truncate_wal(dirpath)
-        elif dirty:
-            # BUG: snapshot is the only durable copy
-            write_snapshot(dirpath, jobs)
+        elif dirty or ctx["idem_ops"] or ctx.get("batch"):
+            ops = []
+            if ctx.get("batch"):
+                ops.append({"op": "upsert_batch", "jobs": ctx["batch"]})
+            for jid in sorted(dirty):
+                if jid in jobs:
+                    ops.append({"op": "upsert", "job": jobs[jid]})
+            for key, entry in ctx["idem_ops"]:
+                if entry is None:
+                    ops.append({"op": "idem_del", "key": key})
+                else:
+                    ops.append({"op": "idem", "key": key,
+                                "job_id": entry["job_id"],
+                                "lease_expires_at": entry["lease_expires_at"]})
+            # BUG: snapshot is the only durable copy (WAL skipped)
+            write_snapshot(dirpath, jobs, idem)
         return code
     finally:
         lockfh.close()
@@ -405,3 +619,4 @@ def main(argv):
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
+

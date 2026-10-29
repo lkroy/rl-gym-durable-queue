@@ -21,10 +21,30 @@ acceptance_criteria:
       - test_recovery.py::test_delete_any_single_file_preserves_jobs
 
   REQ-CRASH-ATOMICITY:
-    description: SIGKILL mid-command never corrupts the queue; the next command exits 0, acknowledged jobs are intact, the in-flight op took effect at most once.
+    description: SIGKILL mid-command never corrupts the queue; the next command exits 0, acknowledged jobs are intact, the in-flight op took effect at most once. A torn trailing record in any state file is discarded automatically.
     checks:
       - test_recovery.py::test_kill_mid_enqueue_never_corrupts
       - test_recovery.py::test_kill_mid_compact_never_loses_jobs
+      - test_recovery.py::test_torn_append_recovers
+      - test_batch.py::test_batch_kill_mid_batch_all_or_nothing
+
+  REQ-IDEMPOTENCY:
+    description: claim --idempotency-key KEY returns the same claimed job on repeat without claiming twice; the key->job mapping is durable and concurrency-safe; the mapping is discarded when its lease expires and when the job goes done/dead; a key not matching ^[A-Za-z0-9_-]{1,64}$ -> exit 2.
+    checks:
+      - test_idempotency.py::test_idempotency_key_returns_same_job
+      - test_idempotency.py::test_idempotency_key_discarded_after_lease_expiry
+      - test_idempotency.py::test_idempotency_key_discarded_after_complete
+      - test_idempotency.py::test_idempotency_keys_are_independent
+      - test_idempotency.py::test_idempotency_key_invalid_format
+      - test_idempotency.py::test_idempotency_key_concurrent_same_job
+
+  REQ-BATCH:
+    description: enqueue-batch --jobs '<json-array>' validates every element before creating anything (any invalid element -> exit 2, nothing created); dedupe resolves per element including against earlier batch elements; the batch is a single atomic mutation (SIGKILL mid-batch leaves all or none); on success prints a JSON array of ids in input order, exit 0.
+    checks:
+      - test_batch.py::test_batch_happy_path
+      - test_batch.py::test_batch_invalid_element_aborts_everything
+      - test_batch.py::test_batch_dedupe_within_batch
+      - test_batch.py::test_batch_kill_mid_batch_all_or_nothing
 
   REQ-COMPACT:
     description: compact preserves every job regardless of status and reclaims disk space once state has grown.
