@@ -56,6 +56,8 @@ acceptance_criteria:
     description: Concurrent processes never deliver the same job twice; mutations are atomic.
     checks:
       - test_concurrency.py::test_parallel_claim_no_double_delivery
+      - test_concurrency.py::test_parallel_enqueue_no_lost_or_duplicate_jobs
+      - test_concurrency.py::test_parallel_mixed_ops_keep_queue_consistent
 
   REQ-JOB-FIELDS:
     description: Job fields, types and defaults (id/payload/priority/max_attempts/attempts/status/timestamps/dedupe/lease/last_error/result).

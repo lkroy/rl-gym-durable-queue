@@ -13,7 +13,7 @@
     "scheduling": 1.0
   },
   "failed": [],
-  "passed": 44,
-  "total": 44,
+  "passed": 46,
+  "total": 46,
   "q_bin": "/home/hatch/workspace/rl-gym-durable-queue/.solution-ref/q"
 }

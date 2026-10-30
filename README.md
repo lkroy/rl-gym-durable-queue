@@ -19,7 +19,7 @@ concurrency.
 ├── environment/Dockerfile  # python:3.11-slim + pytest + pyyaml, WORKDIR /work
 ├── reference/              # reference solution (scores 1.0)
 ├── evaluation/
-│   ├── tests/              # 44 black-box pytest checks (subprocess only)
+│   ├── tests/              # 46 black-box pytest checks (subprocess only)
 │   ├── score.py            # weighted scorer (prints JSON)
 │   ├── check_mutants.py    # verifies all 11 mutants are caught
 │   ├── acceptance-criteria.yml

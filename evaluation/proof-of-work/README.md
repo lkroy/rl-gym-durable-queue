@@ -4,7 +4,7 @@
 
 `reference-run.log` is the real output of `npm run check:reference`
 (reference installed as the solution, full verifier suite run).
-Result: **score 1.0, 44/44 checks passed** (all 10 categories: core,
+Result: **score 1.0, 46/46 checks passed** (all 10 categories: core,
 scheduling, retries, dedupe, lease, recovery, concurrency, idempotency,
 batch, cli), verified 2026-10-29 after the reviewer iteration (idempotent
 claim + atomic batch features; layout-agnostic persistence check;
