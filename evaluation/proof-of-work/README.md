@@ -56,7 +56,11 @@ many read/write/run/debug actions), so these scores are the model's
 best case; an agentic run would face additional failure modes.
 
 Difficulty gate (< 0.30 for two different frontier models): **not yet
-demonstrated**. Recommendation: run the two contracted OpenHands
+demonstrated**. A third one-shot run against the newest spec (with the
+idempotent-claim and batch features) was not performed — no API key was
+available. Per the reviewer's note, difficulty will be judged by their own
+post-submission runs (two top frontier models, expected < 40% each), which
+is the appropriate harness for this bar. Recommendation: run the two contracted OpenHands
 evaluations with the exact commands below before judging the gate — if
 those also land well above 0.30, broaden the task's interacting
 workflows rather than tightening the spec further.
