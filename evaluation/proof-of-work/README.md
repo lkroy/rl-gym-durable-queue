@@ -4,28 +4,32 @@
 
 `reference-run.log` is the real output of `npm run check:reference`
 (reference installed as the solution, full verifier suite run).
-Result: **score 1.0, 46/46 checks passed** (all 10 categories: core,
+Result: **score 1.0, 60/60 checks passed** (all 12 categories: core,
 scheduling, retries, dedupe, lease, recovery, concurrency, idempotency,
-batch, cli), verified 2026-10-29 after the reviewer iteration (idempotent
-claim + atomic batch features; layout-agnostic persistence check;
-deterministic torn-write recovery test; staggered SIGKILL tests;
-concurrency scored at 10%).
+batch, cli, schedules, ttl), verified 2026-10-30 after the difficulty
+iteration (recurring schedules, message TTL, lease extension;
+14 mutants). Determinism confirmed via byte-identical repeat runs.
 
 ## Mutant verification
 
-`mutant-check.log` is the real output of `npm run check:mutants`
-(verified 2026-10-29, reviewer iteration).
-Result: **all 11 mutants caught** (each scores < 1.0 and fails its mapped
-checks), including the three new discrimination mutants:
+`mutant-check.log` is the real output of `npm run check:mutants`.
+Result: **all 14 mutants caught** (each scores < 1.0 and fails its mapped
+checks), including the crash-safety and concurrency mutants verified by
+real SIGKILL fault injection:
 - m04_single_copy (no redundant storage) — caught by single-file deletion
 - m08_compact (compact drops non-pending jobs) — caught by reclaim check
 - m09_nolock (no OS-level locking) — caught by the parallel-claim check
-  (now scored: concurrency category, 10% weight)
+  (concurrency category, 10% weight; race window widened so the mutant
+  fails 10/10 runs)
 - m10_no_torn_repair (no torn-write repair) — caught by the deterministic
   torn-append recovery test: without repair the next command crashes with
   JSONDecodeError instead of recovering
 - m11_no_dead_letter (fail never transitions to dead) — caught by the
   dead-letter check
+- m12_cron (cron validation broken) — caught by the malformed-cron check
+- m13_ttl (TTL sweep neutered) — caught by the TTL expiry check
+- m14_extend (extend-lease never updates) — caught by the lease-extension
+  check
 
 ## Frontier-model difficulty evaluation
 

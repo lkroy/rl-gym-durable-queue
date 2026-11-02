@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the 11 mutant copies of reference/q (one realistic bug each).
+"""Generate the 14 mutant copies of reference/q (one realistic bug each).
 
 Run from the repo root: python3 evaluation/mutants/make_mutants.py
 Idempotent: rewrites evaluation/mutants/m0* and mutants.yml.
@@ -117,14 +117,14 @@ mutant("m08_compact",
        lambda s: sub_once(
            s,
            '        if ctx.get("compact"):\n'
-           '            write_snapshot(dirpath, jobs, idem)\n'
+           '            write_snapshot(dirpath, jobs, idem, schedules)\n'
            '            truncate_wal(dirpath)',
            '        if ctx.get("compact"):\n'
            '            # BUG: compact archives away non-pending jobs\n'
            '            write_snapshot(dirpath, {jid: j\n'
            '                                     for jid, j in jobs.items()\n'
            '                                     if j["status"] == "pending"},\n'
-           '                             idem)\n'
+           '                             idem, {})\n'
            '            truncate_wal(dirpath)'))
 
 
@@ -161,6 +161,44 @@ mutant("m11_no_dead_letter",
            "    if False:  # BUG: dead-lettering disabled\n"
            "        job[\"status\"] = \"dead\"\n"
            "    else:"))
+
+
+# 12. cron validation disabled: malformed expressions are accepted
+mutant("m12_cron",
+       "cron field validation disabled; malformed expressions accepted",
+       ["test_schedules.py::test_schedule_malformed_cron_rejected"],
+       lambda s: replace_function(
+           s, "_parse_cron_field",
+           "def _parse_cron_field(text, lo, hi, name):\n"
+           "    return set(range(lo, hi + 1)), False  # BUG: no validation\n\n"))
+
+
+# 13. TTL sweep disabled: expired jobs never die
+mutant("m13_ttl",
+       "TTL sweep disabled; jobs past their TTL never expire",
+       ["test_ttl.py::test_ttl_pending_job_expires"],
+       lambda s: replace_function(
+           s, "sweep_ttl",
+           "def sweep_ttl(jobs, t):\n"
+           "    return []  # BUG: TTLs never expire\n\n"))
+
+
+# 14. extend-lease validates but never updates the lease
+mutant("m14_extend",
+       "extend-lease validates but never updates lease_expires_at",
+       ["test_lease.py::test_extend_lease_prolongs_claim"],
+       lambda s: sub_once(
+           s,
+           "    if args.lease <= 0:\n"
+           "        die(\"lease must be > 0\", 2)\n"
+           "    job[\"lease_expires_at\"] = t + args.lease\n"
+           "    dirty.add(job[\"id\"])\n"
+           "    # Keep any idempotency mapping coherent with the new lease so a retry",
+           "    if args.lease <= 0:\n"
+           "        die(\"lease must be > 0\", 2)\n"
+           "    pass  # BUG: lease never extended\n"
+           "    dirty.add(job[\"id\"])\n"
+           "    # Keep any idempotency mapping coherent with the new lease so a retry"))
 
 
 def main():

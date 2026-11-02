@@ -10,10 +10,12 @@
     "lease": 1.0,
     "recovery": 1.0,
     "retries": 1.0,
-    "scheduling": 1.0
+    "schedules": 1.0,
+    "scheduling": 1.0,
+    "ttl": 1.0
   },
   "failed": [],
-  "passed": 46,
-  "total": 46,
+  "passed": 60,
+  "total": 60,
   "q_bin": "/home/hatch/workspace/rl-gym-durable-queue/.solution-ref/q"
 }

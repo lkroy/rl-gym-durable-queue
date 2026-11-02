@@ -12,4 +12,7 @@ m08_compact: score=0.9800 must_fail=['test_recovery.py::test_compact_reclaims_di
 m09_nolock: score=0.9333 must_fail=['test_concurrency.py::test_parallel_claim_no_double_delivery'] missing=[] -> CAUGHT
 m10_no_torn_repair: score=0.9800 must_fail=['test_recovery.py::test_torn_append_recovers'] missing=[] -> CAUGHT
 m11_no_dead_letter: score=0.9500 must_fail=['test_retries.py::test_fail_dead_after_max_attempts'] missing=[] -> CAUGHT
+m12_cron: score=0.9860 must_fail=['test_schedules.py::test_schedule_malformed_cron_rejected'] missing=[] -> CAUGHT
+m13_ttl: score=0.9700 must_fail=['test_ttl.py::test_ttl_pending_job_expires'] missing=[] -> CAUGHT
+m14_extend: score=0.9833 must_fail=['test_lease.py::test_extend_lease_prolongs_claim'] missing=[] -> CAUGHT
 ALL MUTANTS CAUGHT

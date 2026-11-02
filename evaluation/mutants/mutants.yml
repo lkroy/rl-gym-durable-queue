@@ -57,3 +57,18 @@ mutants:
     file: m11_no_dead_letter
     must_fail:
     - test_retries.py::test_fail_dead_after_max_attempts
+  m12_cron:
+    bug: cron field validation disabled; malformed expressions accepted
+    file: m12_cron
+    must_fail:
+    - test_schedules.py::test_schedule_malformed_cron_rejected
+  m13_ttl:
+    bug: TTL sweep disabled; jobs past their TTL never expire
+    file: m13_ttl
+    must_fail:
+    - test_ttl.py::test_ttl_pending_job_expires
+  m14_extend:
+    bug: extend-lease validates but never updates lease_expires_at
+    file: m14_extend
+    must_fail:
+    - test_lease.py::test_extend_lease_prolongs_claim
