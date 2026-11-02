@@ -60,7 +60,7 @@ acceptance_criteria:
       - test_concurrency.py::test_parallel_mixed_ops_keep_queue_consistent
 
   REQ-JOB-FIELDS:
-    description: Job fields, types and defaults (id/payload/priority/max_attempts/attempts/status/timestamps/dedupe/lease/last_error/result).
+    description: Job fields, types and defaults (id/payload/priority/max_attempts/attempts/status/timestamps/dedupe/lease/last_error/result/fence).
     checks:
       - test_core.py::test_show_roundtrips_payload
 
@@ -96,7 +96,7 @@ acceptance_criteria:
       - test_cli.py::test_show_unknown
 
   REQ-CLAIM:
-    description: claim sweeps expired leases first; candidates pending && run_at<=now; order priority desc, created_at asc, id asc; sets claimed_at/lease_expires_at; prints full job JSON; none -> "no jobs available", exit 1; lease<=0 -> exit 2.
+    description: claim sweeps expired leases first; candidates pending && run_at<=now; order priority desc, created_at asc, id asc; sets claimed_at/lease_expires_at; prints full job JSON; none -> "no jobs available", exit 1; lease<=0 -> exit 2; each claim bumps the job's fence; --count N claims up to N candidates atomically.
     checks:
       - test_core.py::test_claim_complete_flow
       - test_scheduling.py::test_priority_order
@@ -106,16 +106,47 @@ acceptance_criteria:
       - test_cli.py::test_zero_lease
       - test_lease.py::test_lease_expiry_reclaim
 
+  REQ-FENCING:
+    description: Every job carries a fence (0 at enqueue); each transition into claimed bumps it by 1 (idempotent re-claim via the same key does not); complete/fail/extend-lease require --fence (missing/bad -> exit 2); unknown id -> 4; not claimed -> "not claimed" exit 3; wrong fence -> "stale fence" exit 3, job untouched; extend-lease never changes the fence.
+    checks:
+      - test_fencing.py::test_fence_starts_zero_bumps_on_claim
+      - test_fencing.py::test_complete_stale_fence_rejected
+      - test_fencing.py::test_extend_lease_stale_fence_rejected
+      - test_fencing.py::test_complete_missing_fence_rejected
+      - test_fencing.py::test_fail_stale_fence_rejected
+      - test_fencing.py::test_idempotent_reclaim_keeps_fence
+      - test_fencing.py::test_fence_bumps_on_fail_requeue
+
+  REQ-TZ-SCHEDULES:
+    description: schedule --tz NAME selects the IANA timezone the cron expression is evaluated in (default UTC; unknown name -> exit 2); job ids use the occurrence's local wall-clock; DST gaps are skipped; ambiguous local times materialize exactly one job at the first occurrence; the schedules summary includes tz.
+    checks:
+      - test_tz.py::test_schedule_invalid_tz_rejected
+      - test_tz.py::test_schedules_default_tz_utc
+      - test_tz.py::test_schedules_summary_shows_tz
+      - test_tz.py::test_tz_new_york_materializes_local_wallclock
+      - test_tz.py::test_utc_schedule_id_uses_utc_wallclock
+
+  REQ-BATCH-CLAIM:
+    description: claim --count N atomically claims up to N candidates in claim order (priority desc, created_at asc, id asc), each with its fence bumped; prints a JSON array when --count is passed; --count < 1 or non-integer -> exit 2; --idempotency-key with --count > 1 -> exit 2; concurrent batch claims never overlap.
+    checks:
+      - test_claim_batch.py::test_claim_count_three_priority_order
+      - test_claim_batch.py::test_claim_count_more_than_available
+      - test_claim_batch.py::test_claim_count_empty
+      - test_claim_batch.py::test_claim_count_invalid
+      - test_claim_batch.py::test_claim_count_with_idempotency_key_rejected
+      - test_claim_batch.py::test_parallel_claim_count_no_double_delivery
+
   REQ-EXTEND-LEASE:
-    description: extend-lease sets lease_expires_at=now+lease on a claimed job; unknown id -> exit 4; non-claimed -> "not claimed", exit 3; lease<=0 -> exit 2.
+    description: extend-lease ID --fence F --lease SEC sets lease_expires_at=now+lease on a claimed job without changing its fence; unknown id -> exit 4; non-claimed -> "not claimed", exit 3; missing/bad --fence -> exit 2; wrong fence -> "stale fence", exit 3; lease<=0 -> exit 2.
     checks:
       - test_lease.py::test_extend_lease_prolongs_claim
       - test_lease.py::test_extend_lease_pending_conflict
       - test_lease.py::test_extend_lease_unknown_id
       - test_lease.py::test_extend_lease_bad_lease
+      - test_fencing.py::test_extend_lease_stale_fence_rejected
 
   REQ-SCHEDULES:
-    description: schedule creates recurring schedules with full cron grammar (UTC, dom/dow OR-rule); due occurrences materialize as jobs with deterministic ids on every command; unschedule removes the schedule but keeps jobs; malformed cron -> exit 2; end-at excludes occurrences.
+    description: schedule creates recurring schedules with full cron grammar (timezone-aware via --tz, default UTC; dom/dow OR-rule); due occurrences materialize as jobs with deterministic ids on every command; unschedule removes the schedule but keeps jobs; malformed cron -> exit 2; end-at excludes occurrences.
     checks:
       - test_schedules.py::test_schedule_every_minute_materializes
       - test_schedules.py::test_unschedule_stops_but_keeps_jobs
@@ -133,17 +164,20 @@ acceptance_criteria:
       - test_ttl.py::test_ttl_nonpositive_rejected
 
   REQ-COMPLETE:
-    description: complete requires claimed (else "not claimed", exit 3); unknown -> exit 4; bad result JSON -> exit 2; sets done + result.
+    description: complete ID --fence F requires claimed (else "not claimed", exit 3); unknown -> exit 4; missing/bad --fence -> exit 2; wrong fence -> "stale fence", exit 3; bad result JSON -> exit 2; sets done + result.
     checks:
       - test_core.py::test_claim_complete_flow
       - test_cli.py::test_complete_pending_conflict
+      - test_fencing.py::test_complete_stale_fence_rejected
+      - test_fencing.py::test_complete_missing_fence_rejected
 
   REQ-FAIL:
-    description: fail requires claimed (else exit 3); unknown -> exit 4; attempts+=1; attempts>=max_attempts -> dead else pending with run_at=now+10*2**(attempts-1), lease cleared, last_error set.
+    description: fail ID --fence F requires claimed (else exit 3); unknown -> exit 4; missing/bad --fence -> exit 2; wrong fence -> "stale fence", exit 3; attempts+=1; attempts>=max_attempts -> dead else pending with run_at=now+10*2**(attempts-1), lease cleared, last_error set; the fence is not reset.
     checks:
       - test_retries.py::test_fail_backoff_requeue
       - test_retries.py::test_fail_dead_after_max_attempts
       - test_retries.py::test_fail_pending_conflict
+      - test_fencing.py::test_fail_stale_fence_rejected
 
   REQ-STATS:
     description: stats prints pending/claimed/done/dead/total counts, exit 0.
