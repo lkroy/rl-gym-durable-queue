@@ -106,6 +106,32 @@ acceptance_criteria:
       - test_cli.py::test_zero_lease
       - test_lease.py::test_lease_expiry_reclaim
 
+  REQ-EXTEND-LEASE:
+    description: extend-lease sets lease_expires_at=now+lease on a claimed job; unknown id -> exit 4; non-claimed -> "not claimed", exit 3; lease<=0 -> exit 2.
+    checks:
+      - test_lease.py::test_extend_lease_prolongs_claim
+      - test_lease.py::test_extend_lease_pending_conflict
+      - test_lease.py::test_extend_lease_unknown_id
+      - test_lease.py::test_extend_lease_bad_lease
+
+  REQ-SCHEDULES:
+    description: schedule creates recurring schedules with full cron grammar (UTC, dom/dow OR-rule); due occurrences materialize as jobs with deterministic ids on every command; unschedule removes the schedule but keeps jobs; malformed cron -> exit 2; end-at excludes occurrences.
+    checks:
+      - test_schedules.py::test_schedule_every_minute_materializes
+      - test_schedules.py::test_unschedule_stops_but_keeps_jobs
+      - test_schedules.py::test_schedule_malformed_cron_rejected
+      - test_schedules.py::test_schedule_end_at_past_materializes_nothing
+      - test_schedules.py::test_schedule_kill_during_materialization
+
+  REQ-TTL:
+    description: enqueue --ttl>0 else exit 2; pending jobs past TTL -> dead with last_error "expired"; claimed jobs exempt while lease valid, dead (not requeued) once lease expires.
+    checks:
+      - test_ttl.py::test_ttl_pending_job_expires
+      - test_ttl.py::test_ttl_claimed_job_exempt_while_lease_valid
+      - test_ttl.py::test_ttl_claimed_job_dead_after_lease_expiry
+      - test_ttl.py::test_ttl_delayed_job_expires_before_claimable
+      - test_ttl.py::test_ttl_nonpositive_rejected
+
   REQ-COMPLETE:
     description: complete requires claimed (else "not claimed", exit 3); unknown -> exit 4; bad result JSON -> exit 2; sets done + result.
     checks:
