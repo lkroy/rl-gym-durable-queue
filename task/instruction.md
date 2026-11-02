@@ -62,10 +62,37 @@ Fields and defaults:
 | ttl                | float or null     | null (no expiry)                   |
 | claimed_at         | float or null     | null                             |
 | lease_expires_at   | float or null     | null                             |
+| fence              | int               | 0 (see Fencing tokens)             |
 | last_error         | string or null    | null                             |
 | result             | any JSON or null  | null                             |
 
 `status` is one of `pending`, `claimed`, `done`, `dead`.
+
+## Fencing tokens
+
+Every job carries a `fence`: a non-negative integer, starting at 0. It is
+incremented by exactly 1 on EVERY transition of the job into `claimed`
+— the first claim, a reclaim after lease expiry, a claim after a
+`fail`-requeue. It is never decremented, and `extend-lease` does NOT
+change it. A repeat `claim` served from an existing idempotency-key
+mapping returns the same job with the same fence (it is the same claim,
+not a new transition).
+
+The fence is printed as part of the job object in `claim` output. Any
+command that mutates a claimed job — `complete`, `fail`,
+`extend-lease` — REQUIRES `--fence F`, the fence value the caller saw
+when it claimed the job:
+
+- `--fence` missing, or not a non-negative integer → exit 2.
+- Unknown job id → exit 4 (checked before the fence).
+- Job not `claimed` → stderr MUST contain `not claimed`, exit 3.
+- Fence does not equal the job's current fence → stderr MUST contain
+  `stale fence`, exit 3. The job is left untouched.
+
+The guarantee this buys: a worker that claimed a job, lost its lease
+(crash, slowness), and then tries to `complete` / `fail` /
+`extend-lease` AFTER another worker has reclaimed the job MUST be
+rejected — its fence is stale, and the new holder's work is protected.
 
 ## Pre-steps (run at the start of every command)
 
@@ -136,16 +163,24 @@ print a message to stderr.
   - Print the full job object as JSON, exit 0.
   - Unknown id: stderr MUST contain `job not found`, exit 4.
 
-- `q claim [--lease SEC] [--idempotency-key KEY]` (default 60)
+- `q claim [--lease SEC] [--idempotency-key KEY] [--count N]` (defaults:
+  lease 60, count 1)
   - `--lease` MUST be > 0, otherwise exit 2.
+  - `--count` MUST be an integer >= 1, otherwise exit 2. With `--count N`,
+    up to N candidates are claimed atomically, in claim order; each one
+    gets `claimed_at = now`, `lease_expires_at = now + lease`, and its
+    fence incremented. The whole multi-claim is one atomic unit:
+    concurrent `claim` invocations MUST NEVER deliver the same job twice,
+    whatever `--count` each used.
   - `--idempotency-key`, when given, MUST match `^[A-Za-z0-9_-]{1,64}$`,
-    otherwise exit 2.
+    otherwise exit 2. It is only valid with the default `--count 1`;
+    combining it with `--count` > 1 is exit 2.
   - The pre-steps run first (materialization, lease sweep, TTL sweep).
   - If KEY is given and maps to a job that is currently `claimed` with an
-    unexpired lease, return THAT job (full JSON), exit 0. Do NOT claim a
-    new job and do NOT extend the lease. This gives exactly-once delivery
-    across client retries and crashes.
-  - Otherwise claim the best candidate as usual; if a candidate is
+    unexpired lease, return THAT job (full JSON, same fence), exit 0. Do
+    NOT claim a new job and do NOT extend the lease. This gives
+    exactly-once delivery across client retries and crashes.
+  - Otherwise claim the best candidate(s) as usual; if a candidate is
     claimed, record KEY as mapped to it (replacing any stale mapping).
     Mappings for jobs that become `done` or `dead` are discarded, so a
     later claim with the same KEY starts fresh.
@@ -154,56 +189,75 @@ print a message to stderr.
     KEY MUST receive the same job, never two different jobs.
   - Candidates: status `pending` AND `run_at <= now`.
   - Order: `priority` descending, then `created_at` ascending, then `id`
-    ascending. Claim the first candidate: set status `claimed`,
-    `claimed_at = now`, `lease_expires_at = now + lease`.
-  - Print the full job object as JSON, exit 0.
+    ascending. Claim the first candidate(s): set status `claimed`,
+    `claimed_at = now`, `lease_expires_at = now + lease`, bump the fence.
+  - Print the full job object as JSON (for `--count N`, a JSON array of
+    the claimed job objects in claim order), exit 0.
   - If no candidate: stderr MUST contain `no jobs available`, exit 1.
 
-- `q complete ID [--result JSON]`
+- `q complete ID --fence F [--result JSON]`
+  - `--fence` is REQUIRED (see Fencing tokens): missing or not a
+    non-negative integer → exit 2.
   - Unknown id: exit 4.
   - The job MUST have status `claimed`, otherwise stderr MUST contain
     `not claimed` and exit 3.
+  - The fence MUST equal the job's current fence, otherwise stderr MUST
+    contain `stale fence` and exit 3.
   - `--result` MUST be valid JSON when given, otherwise exit 2.
   - Set status `done`, store `result`, print the job id, exit 0.
 
-- `q fail ID [--error MSG]`
+- `q fail ID --fence F [--error MSG]`
+  - `--fence` is REQUIRED (see Fencing tokens): missing or not a
+    non-negative integer → exit 2.
   - Unknown id: exit 4.
   - The job MUST have status `claimed`, otherwise exit 3.
+  - The fence MUST equal the job's current fence, otherwise stderr MUST
+    contain `stale fence` and exit 3.
   - Increment `attempts`. If `attempts >= max_attempts`, status becomes
     `dead`. Otherwise status becomes `pending` with
     `run_at = now + 10 * 2**(attempts-1)` (10s, 20s, 40s, ...), and
     `claimed_at` / `lease_expires_at` are cleared. `last_error` is set to
-    MSG (or null).
+    MSG (or null). (The fence is NOT reset: it bumps again on the next
+    claim.)
   - Print the job id, exit 0.
 
 - `q stats`
   - Print `{"pending":n,"claimed":n,"done":n,"dead":n,"total":n}`, exit 0.
 
 - `q schedule --payload JSON --cron EXPR [--id ID] [--priority INT]
-  [--max-attempts N] [--end-at EPOCH]`
+  [--max-attempts N] [--end-at EPOCH] [--tz NAME]`
   - Creates a recurring schedule. `--payload` MUST be valid JSON,
     otherwise exit 2. `--id`, when given, MUST match
     `^[A-Za-z0-9_-]{1,64}$` and MUST NOT duplicate an existing schedule
     id, otherwise exit 2. `--max-attempts` MUST be >= 1, otherwise exit 2.
+  - `--tz` names the timezone the cron expression is evaluated in: an
+    IANA timezone name (e.g. `America/New_York`), default `UTC`. An
+    unknown timezone name → exit 2.
   - `--cron` is a 5-field expression `minute hour dom month dow`
-    evaluated in UTC. Each field accepts `*`, `*/step`, `a-b`,
-    `a-b/step`, `a,b,c`, or a single value. Ranges: minute 0-59, hour
-    0-23, dom 1-31, month 1-12, dow 0-6 (0 and 7 both mean Sunday). Any
-    malformed field or out-of-range value → exit 2. A date that never
-    exists (e.g. Feb 30) simply never matches.
+    evaluated against the local wall-clock in `--tz`. Each field accepts
+    `*`, `*/step`, `a-b`, `a-b/step`, `a,b,c`, or a single value.
+    Ranges: minute 0-59, hour 0-23, dom 1-31, month 1-12, dow 0-6 (0 and
+    7 both mean Sunday). Any malformed field or out-of-range value →
+    exit 2. A date that never exists (e.g. Feb 30) simply never matches.
   - Matching rule: an occurrence exists at each minute where minute,
     hour and month match, and (dom matches OR dow matches) — with the
     standard refinement that if one of dom/dow is `*` (unrestricted),
     the other alone decides.
+  - Daylight-saving transitions in `--tz`:
+    - Local times that do not exist (spring-forward gap, e.g. 02:30 on
+      the day clocks jump forward) are SKIPPED: no job is materialized
+      for them.
+    - Ambiguous local times (fall-back overlap, e.g. 01:30 occurring
+      twice) materialize EXACTLY ONE job, at the first occurrence.
   - `--end-at`, when given, is an epoch timestamp: occurrences at or
     after it are never materialized.
   - On success: print the schedule id, exit 0.
 
 - `q schedules`
   - Print a JSON array of schedule summaries, one per schedule:
-    `{"id","cron","priority","max_attempts","end_at","last_materialized",
-    "created_at"}` (`end_at`/`last_materialized` null when unset).
-    Exit 0.
+    `{"id","cron","tz","priority","max_attempts","end_at",
+    "last_materialized","created_at"}` (`end_at`/`last_materialized`
+    null when unset). Exit 0.
 
 - `q unschedule ID`
   - Unknown schedule id: exit 4. Remove the schedule (jobs already
@@ -211,21 +265,30 @@ print a message to stderr.
     exit 0.
 
 - Materialized occurrences: each due occurrence becomes a regular job
-  with `run_at` = occurrence time, `created_at` = materialization time,
+  with `run_at` = occurrence time (epoch seconds; for an ambiguous local
+  time, the first occurrence), `created_at` = materialization time,
   and the schedule's `priority`/`max_attempts`. Its id is
-  `{schedule_id}-{YYYYMMDDHHMM}` (UTC), which makes materialization
-  idempotent: re-running it after a crash MUST NOT create duplicates,
-  and `last_materialized` MUST advance atomically with the created jobs
-  so no occurrence is skipped. On the first materialization, only
-  occurrences at or after the schedule's creation time are considered
-  (no backfill from before the schedule existed).
+  `{schedule_id}-{YYYYMMDDHHMM}` using the occurrence's LOCAL wall-clock
+  in the schedule's timezone, which makes materialization idempotent:
+  re-running it after a crash MUST NOT create duplicates, and
+  `last_materialized` MUST advance atomically with the created jobs so no
+  occurrence is skipped. On the first materialization, only occurrences
+  at or after the schedule's creation time are considered (no backfill
+  from before the schedule existed).
 
-- `q extend-lease ID --lease SEC`
+- `q extend-lease ID --fence F --lease SEC`
+  - `--fence` is REQUIRED (see Fencing tokens): missing or not a
+    non-negative integer → exit 2.
   - Unknown id: exit 4.
   - The job MUST have status `claimed`, otherwise stderr MUST contain
     `not claimed` and exit 3.
+  - The fence MUST equal the job's current fence, otherwise stderr MUST
+    contain `stale fence` and exit 3. (A worker whose lease expired and
+    whose job was reclaimed by someone else cannot extend the new
+    holder's lease.)
   - `--lease` MUST be > 0, otherwise exit 2.
-  - Set `lease_expires_at = now + lease`. Print the job id, exit 0.
+  - Set `lease_expires_at = now + lease`. The fence is NOT changed.
+    Print the job id, exit 0.
 
 - `q compact`
   - Reclaim space used by the redundant storage: rewrite the durable state
@@ -239,5 +302,6 @@ print a message to stderr.
 - 0: success
 - 1: no jobs available (claim found no candidate)
 - 2: usage / validation error
-- 3: state conflict (complete/fail on a job that is not claimed)
+- 3: state conflict (complete/fail/extend-lease on a job that is not
+  claimed, or presented with a stale fence token)
 - 4: not found (unknown job id)
