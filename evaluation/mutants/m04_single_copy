@@ -11,6 +11,7 @@ atomically (tmp + fsync + rename), unlock.
 """
 
 import argparse
+import datetime
 import fcntl
 import json
 import os
@@ -74,6 +75,11 @@ def _well_formed_op(obj):
                 and isinstance(obj.get("job_id"), str))
     if op == "idem_del":
         return isinstance(obj.get("key"), str)
+    if op == "sched":
+        return (isinstance(obj.get("sched"), dict)
+                and bool(obj["sched"].get("id")))
+    if op == "sched_del":
+        return isinstance(obj.get("id"), str)
     return False
 
 
@@ -197,6 +203,48 @@ def _load_wal_idem(path):
     return idem
 
 
+def _load_sched_snapshot(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+    scheds = obj.get("schedules") if isinstance(obj, dict) else None
+    if not isinstance(scheds, dict):
+        return {}
+    clean = {}
+    for key, val in scheds.items():
+        if isinstance(val, dict) and val.get("id") == key:
+            clean[key] = val
+    return clean
+
+
+def _load_wal_sched(path):
+    _truncate_torn_tail(path)
+    scheds = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                if obj.get("op") == "sched":
+                    s = obj["sched"]
+                    scheds[s["id"]] = s
+                elif obj.get("op") == "sched_del":
+                    scheds.pop(obj["id"], None)
+    except FileNotFoundError:
+        pass
+    return scheds
+
+
+def load_sched(dirpath):
+    scheds = _load_sched_snapshot(os.path.join(dirpath, "snapshot.json"))
+    scheds.update(_load_wal_sched(os.path.join(dirpath, "wal.log")))
+    return scheds
+
+
 def load_state(dirpath):
     # BUG: single copy of state; nothing to rebuild from
     return _load_snapshot(os.path.join(dirpath, "snapshot.json"))
@@ -221,11 +269,12 @@ def append_ops(dirpath, ops):
     _fsync_dir(dirpath)
 
 
-def write_snapshot(dirpath, jobs, idem):
+def write_snapshot(dirpath, jobs, idem, schedules):
     path = os.path.join(dirpath, "snapshot.json")
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"jobs": jobs, "idem": idem}, f, separators=(",", ":"))
+        json.dump({"jobs": jobs, "idem": idem, "schedules": schedules},
+                  f, separators=(",", ":"))
         f.flush()
         os.fsync(f.fileno())
     os.rename(tmp, path)
@@ -243,17 +292,190 @@ def truncate_wal(dirpath):
 # ------------------------------------------------------------------ logic ---
 
 def sweep_expired(jobs, t):
-    """Return claimed jobs whose lease expired back to pending. Ids changed."""
+    """Return claimed jobs whose lease expired back to pending. Ids changed.
+
+    Jobs past their TTL are left alone here; the TTL sweep (pre-step 3)
+    marks them dead instead of requeueing them.
+    """
     changed = []
     for job in jobs.values():
         if (job["status"] == "claimed"
                 and job.get("lease_expires_at") is not None
                 and job["lease_expires_at"] <= t):
+            ttl = job.get("ttl")
+            if ttl is not None and t - job["created_at"] > ttl:
+                continue
             job["status"] = "pending"
             job["claimed_at"] = None
             job["lease_expires_at"] = None
             changed.append(job["id"])
     return changed
+
+
+def sweep_ttl(jobs, t):
+    """Expire jobs past their TTL. Returns ids changed.
+
+    Pending jobs past TTL become dead. Claimed jobs are exempt while their
+    lease is valid; with an expired lease they go dead (not back to pending).
+    """
+    changed = []
+    for job in jobs.values():
+        ttl = job.get("ttl")
+        if ttl is None:
+            continue
+        if t - job["created_at"] <= ttl:
+            continue
+        if job["status"] == "pending":
+            job["status"] = "dead"
+            job["last_error"] = "expired"
+            changed.append(job["id"])
+        elif job["status"] == "claimed":
+            lease = job.get("lease_expires_at")
+            if lease is not None and lease > t:
+                continue
+            job["status"] = "dead"
+            job["claimed_at"] = None
+            job["lease_expires_at"] = None
+            job["last_error"] = "expired"
+            changed.append(job["id"])
+    return changed
+
+
+def _parse_cron_field(text, lo, hi, name):
+    """Parse one cron field. Returns (set_of_values, is_star). Dies 2."""
+    if text == "*":
+        return set(range(lo, hi + 1)), True
+    values = set()
+    for part in text.split(","):
+        if not part:
+            die("invalid cron: empty part in %s field" % name, 2)
+        if "/" in part:
+            base, step_s = part.split("/", 1)
+            if base != "*" and "-" not in base:
+                die("invalid cron: bad step base in %s field" % name, 2)
+            try:
+                step = int(step_s)
+            except ValueError:
+                die("invalid cron: bad step in %s field" % name, 2)
+            if step < 1:
+                die("invalid cron: step must be >= 1 in %s field" % name, 2)
+        else:
+            base, step = part, 1
+        if base == "*":
+            start, end = lo, hi
+        elif "-" in base:
+            a_s, b_s = base.split("-", 1)
+            try:
+                start, end = int(a_s), int(b_s)
+            except ValueError:
+                die("invalid cron: bad range in %s field" % name, 2)
+        else:
+            try:
+                start = end = int(base)
+            except ValueError:
+                die("invalid cron: bad value in %s field" % name, 2)
+        if not (lo <= start <= hi and lo <= end <= hi and start <= end):
+            die("invalid cron: out-of-range value in %s field" % name, 2)
+        for v in range(start, end + 1, step):
+            values.add(v)
+    if not values:
+        die("invalid cron: empty %s field" % name, 2)
+    return values, False
+
+
+def _parse_cron(expr):
+    """Parse a 5-field cron expression. Returns field tuple. Dies 2."""
+    parts = expr.split()
+    if len(parts) != 5:
+        die("invalid cron: expected 5 fields, got %d" % len(parts), 2)
+    minute, _ = _parse_cron_field(parts[0], 0, 59, "minute")
+    hour, _ = _parse_cron_field(parts[1], 0, 23, "hour")
+    dom, dom_star = _parse_cron_field(parts[2], 1, 31, "dom")
+    month, _ = _parse_cron_field(parts[3], 1, 12, "month")
+    dow, dow_star = _parse_cron_field(parts[4], 0, 7, "dow")
+    if 7 in dow:  # 0 and 7 both mean Sunday
+        dow.discard(7)
+        dow.add(0)
+    return (minute, hour, dom, month, dow, dom_star, dow_star)
+
+
+def _utc_dt(epoch):
+    return datetime.datetime.fromtimestamp(epoch, tz=datetime.timezone.utc)
+
+
+def _cron_match(fields, dt):
+    minute, hour, dom, month, dow, dom_star, dow_star = fields
+    if dt.minute not in minute:
+        return False
+    if dt.hour not in hour:
+        return False
+    if dt.month not in month:
+        return False
+    dow_num = (dt.weekday() + 1) % 7  # Monday=0 -> Sunday=0
+    dom_ok = dt.day in dom
+    dow_ok = dow_num in dow
+    if dom_star and dow_star:
+        return True
+    if dom_star:
+        return dow_ok
+    if dow_star:
+        return dom_ok
+    return dom_ok or dow_ok
+
+
+def _materialize(schedules, jobs, t):
+    """Create jobs for due schedule occurrences.
+
+    Returns (new_jobs, changed_schedule_ids). Idempotent: job ids are
+    deterministic, and last_materialized advances atomically with the
+    created jobs (persisted in the same WAL append by the caller).
+    """
+    new_jobs = []
+    changed = set()
+    now_min = int(t // 60) * 60
+    for sid, sched in schedules.items():
+        fields = _parse_cron(sched["cron"])
+        if sched["last_materialized"] is None:
+            start_min = int(sched["created_at"] // 60) * 60
+            occs = [m for m in range(start_min, now_min + 1, 60)
+                    if m >= sched["created_at"]
+                    and _cron_match(fields, _utc_dt(m))]
+        else:
+            start_min = int(sched["last_materialized"]) + 60
+            occs = [m for m in range(start_min, now_min + 1, 60)
+                    if _cron_match(fields, _utc_dt(m))]
+        end_at = sched.get("end_at")
+        if end_at is not None:
+            occs = [m for m in occs if m < end_at]
+        if not occs:
+            continue
+        for m in occs:
+            dt = _utc_dt(m)
+            jid = "%s-%04d%02d%02d%02d%02d" % (
+                sid, dt.year, dt.month, dt.day, dt.hour, dt.minute)
+            if jid in jobs:
+                continue  # already materialized (crash retry); no duplicate
+            job = {
+                "id": jid,
+                "payload": sched["payload"],
+                "priority": sched["priority"],
+                "max_attempts": sched["max_attempts"],
+                "attempts": 0,
+                "status": "pending",
+                "created_at": t,
+                "run_at": float(m),
+                "dedupe_key": None,
+                "ttl": None,
+                "claimed_at": None,
+                "lease_expires_at": None,
+                "last_error": None,
+                "result": None,
+            }
+            jobs[jid] = job
+            new_jobs.append(job)
+        sched["last_materialized"] = float(max(occs))
+        changed.add(sid)
+    return new_jobs, changed
 
 
 def sweep_idem(idem, t):
@@ -323,6 +545,8 @@ def cmd_enqueue(args, jobs, t, dirty, ctx):
         die("delay must be >= 0", 2)
     if args.max_attempts < 1:
         die("max_attempts must be >= 1", 2)
+    if args.ttl is not None and args.ttl <= 0:
+        die("ttl must be > 0", 2)
     if args.dedupe_key is not None:
         hit = _find_dedupe(jobs, args.dedupe_key)
         if hit is not None:
@@ -338,6 +562,7 @@ def cmd_enqueue(args, jobs, t, dirty, ctx):
         "created_at": t,
         "run_at": t + args.delay,
         "dedupe_key": args.dedupe_key,
+        "ttl": args.ttl,
         "claimed_at": None,
         "lease_expires_at": None,
         "last_error": None,
@@ -413,6 +638,7 @@ def cmd_enqueue_batch(args, jobs, t, dirty, ctx):
             "created_at": t,
             "run_at": t + spec["delay"],
             "dedupe_key": spec["dedupe_key"],
+            "ttl": None,
             "claimed_at": None,
             "lease_expires_at": None,
             "last_error": None,
@@ -534,6 +760,84 @@ def cmd_compact(args, jobs, t, dirty, ctx):
     return 0
 
 
+def _new_sched_id(schedules, jobs):
+    while True:
+        sid = secrets.token_hex(8)
+        if sid not in schedules and sid not in jobs:
+            return sid
+
+
+def cmd_schedule(args, jobs, t, dirty, ctx):
+    try:
+        payload = json.loads(args.payload)
+    except ValueError:
+        die("invalid payload: not valid JSON", 2)
+    if args.id is not None:
+        _check_id_format(args.id)
+        if args.id in ctx["schedules"]:
+            die("duplicate schedule id: %s" % args.id, 2)
+        sid = args.id
+    else:
+        sid = _new_sched_id(ctx["schedules"], jobs)
+    if args.max_attempts < 1:
+        die("max_attempts must be >= 1", 2)
+    _parse_cron(args.cron)  # validates; dies 2 on malformed input
+    sched = {
+        "id": sid,
+        "payload": payload,
+        "cron": args.cron,
+        "priority": args.priority,
+        "max_attempts": args.max_attempts,
+        "end_at": args.end_at,
+        "last_materialized": None,
+        "created_at": t,
+    }
+    ctx["schedules"][sid] = sched
+    ctx["dirty_sched"].add(sid)
+    sys.stdout.write(sid + "\n")
+    return 0
+
+
+def cmd_schedules(args, jobs, t, dirty, ctx):
+    rows = [{"id": s["id"], "cron": s["cron"], "priority": s["priority"],
+             "max_attempts": s["max_attempts"], "end_at": s["end_at"],
+             "last_materialized": s["last_materialized"],
+             "created_at": s["created_at"]}
+            for s in ctx["schedules"].values()]
+    rows.sort(key=lambda r: (r["created_at"], r["id"]))
+    sys.stdout.write(json.dumps(rows) + "\n")
+    return 0
+
+
+def cmd_unschedule(args, jobs, t, dirty, ctx):
+    schedules = ctx["schedules"]
+    if args.id not in schedules:
+        die("schedule not found: %s" % args.id, 4)
+    del schedules[args.id]
+    ctx["dirty_sched"].discard(args.id)
+    ctx["sched_dels"].add(args.id)
+    sys.stdout.write(args.id + "\n")
+    return 0
+
+
+def cmd_extend_lease(args, jobs, t, dirty, ctx):
+    job = _get_job_or_die(jobs, args.id)
+    if job["status"] != "claimed":
+        die("job not claimed", 3)
+    if args.lease <= 0:
+        die("lease must be > 0", 2)
+    job["lease_expires_at"] = t + args.lease
+    dirty.add(job["id"])
+    # Keep any idempotency mapping coherent with the new lease so a retry
+    # with the same key still returns this job instead of claiming anew.
+    for key, entry in ctx["idem"].items():
+        if entry["job_id"] == job["id"]:
+            entry["lease_expires_at"] = t + args.lease
+            ctx["idem_ops"].append((key, dict(entry)))
+    sys.stdout.write(job["id"] + "\n")
+    return 0
+
+
 COMMANDS = {
     "enqueue": cmd_enqueue,
     "enqueue-batch": cmd_enqueue_batch,
@@ -543,6 +847,10 @@ COMMANDS = {
     "complete": cmd_complete,
     "fail": cmd_fail,
     "stats": cmd_stats,
+    "schedule": cmd_schedule,
+    "schedules": cmd_schedules,
+    "unschedule": cmd_unschedule,
+    "extend-lease": cmd_extend_lease,
     "compact": cmd_compact,
 }
 
@@ -557,6 +865,7 @@ def parse_args(argv):
     e.add_argument("--id", default=None)
     e.add_argument("--dedupe-key", default=None)
     e.add_argument("--max-attempts", type=int, default=3)
+    e.add_argument("--ttl", type=float, default=None)
     b = sub.add_parser("enqueue-batch", allow_abbrev=False)
     b.add_argument("--jobs", required=True)
     li = sub.add_parser("list", allow_abbrev=False)
@@ -573,6 +882,19 @@ def parse_args(argv):
     fa.add_argument("id")
     fa.add_argument("--error", default=None)
     sub.add_parser("stats", allow_abbrev=False)
+    s = sub.add_parser("schedule", allow_abbrev=False)
+    s.add_argument("--payload", required=True)
+    s.add_argument("--cron", required=True)
+    s.add_argument("--id", default=None)
+    s.add_argument("--priority", type=int, default=0)
+    s.add_argument("--max-attempts", type=int, default=3)
+    s.add_argument("--end-at", type=float, default=None)
+    sub.add_parser("schedules", allow_abbrev=False)
+    u = sub.add_parser("unschedule", allow_abbrev=False)
+    u.add_argument("id")
+    x = sub.add_parser("extend-lease", allow_abbrev=False)
+    x.add_argument("id")
+    x.add_argument("--lease", type=float, required=True)
     sub.add_parser("compact", allow_abbrev=False)
     args = p.parse_args(argv)
     if args.cmd is None:
@@ -588,21 +910,39 @@ def main(argv):
         t = utcnow()
         jobs = load_state(dirpath)
         idem = load_idem(dirpath)
-        dirty = set(sweep_expired(jobs, t))
-        ctx = {"idem": idem, "idem_ops": []}
+        schedules = load_sched(dirpath)
+        dirty = set()
+        ctx = {"idem": idem, "idem_ops": [], "schedules": schedules,
+               "dirty_sched": set(), "sched_dels": set()}
+        # Pre-step 1: materialize due schedule occurrences (atomic with cmd)
+        for job in _materialize(schedules, jobs, t)[0]:
+            dirty.add(job["id"])
+        # Pre-step 2: sweep expired leases (past-TTL jobs left for step 3)
+        dirty.update(sweep_expired(jobs, t))
+        # Pre-step 3: sweep expired TTLs
+        for jid in sweep_ttl(jobs, t):
+            dirty.add(jid)
+            _discard_idem_for_job(ctx, jid)
         for key in sweep_idem(idem, t):
             ctx["idem_ops"].append((key, None))
         code = COMMANDS[args.cmd](args, jobs, t, dirty, ctx)
+        dirty_sched = ctx["dirty_sched"]
+        sched_dels = ctx["sched_dels"]
         if ctx.get("compact"):
-            write_snapshot(dirpath, jobs, idem)
+            write_snapshot(dirpath, jobs, idem, schedules)
             truncate_wal(dirpath)
-        elif dirty or ctx["idem_ops"] or ctx.get("batch"):
+        elif dirty or dirty_sched or sched_dels or ctx["idem_ops"] or ctx.get("batch"):
             ops = []
             if ctx.get("batch"):
                 ops.append({"op": "upsert_batch", "jobs": ctx["batch"]})
             for jid in sorted(dirty):
                 if jid in jobs:
                     ops.append({"op": "upsert", "job": jobs[jid]})
+            for sid in sorted(dirty_sched):
+                if sid in schedules:
+                    ops.append({"op": "sched", "sched": schedules[sid]})
+            for sid in sorted(sched_dels):
+                ops.append({"op": "sched_del", "id": sid})
             for key, entry in ctx["idem_ops"]:
                 if entry is None:
                     ops.append({"op": "idem_del", "key": key})
@@ -611,7 +951,7 @@ def main(argv):
                                 "job_id": entry["job_id"],
                                 "lease_expires_at": entry["lease_expires_at"]})
             # BUG: snapshot is the only durable copy (WAL skipped)
-            write_snapshot(dirpath, jobs, idem)
+            write_snapshot(dirpath, jobs, idem, schedules)
         return code
     finally:
         lockfh.close()
