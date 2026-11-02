@@ -19,6 +19,7 @@ import re
 import secrets
 import sys
 import time
+import zoneinfo
 
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 STATUSES = ("pending", "claimed", "done", "dead")
@@ -27,6 +28,20 @@ STATUSES = ("pending", "claimed", "done", "dead")
 def die(msg, code):
     sys.stderr.write(str(msg) + "\n")
     sys.exit(code)
+
+
+def _get_zone(name):
+    try:
+        return zoneinfo.ZoneInfo(name)
+    except Exception:
+        die("unknown timezone: %s" % name, 2)
+
+
+def _require_fence(args):
+    f = args.fence
+    if f is None or not isinstance(f, int) or f < 0:
+        die("fence is required and must be a non-negative integer", 2)
+    return f
 
 
 def data_dir():
@@ -427,33 +442,51 @@ def _cron_match(fields, dt):
 def _materialize(schedules, jobs, t):
     """Create jobs for due schedule occurrences.
 
+    Cron fields are matched against the local wall-clock in the schedule's
+    timezone. DST gaps (spring-forward) never produce a wall clock, so they
+    are skipped automatically; a fall-back overlap produces the same wall
+    clock twice and only the first occurrence is kept (seen_wall), so
+    exactly one job is materialized.
+
     Returns (new_jobs, changed_schedule_ids). Idempotent: job ids are
-    deterministic, and last_materialized advances atomically with the
-    created jobs (persisted in the same WAL append by the caller).
+    deterministic ({sid}-{local YYYYMMDDHHMM}), and last_materialized
+    advances atomically with the created jobs (persisted in the same WAL
+    append by the caller).
     """
     new_jobs = []
     changed = set()
     now_min = int(t // 60) * 60
     for sid, sched in schedules.items():
         fields = _parse_cron(sched["cron"])
+        tz = _get_zone(sched.get("tz", "UTC"))
         if sched["last_materialized"] is None:
             start_min = int(sched["created_at"] // 60) * 60
-            occs = [m for m in range(start_min, now_min + 1, 60)
-                    if m >= sched["created_at"]
-                    and _cron_match(fields, _utc_dt(m))]
+            minutes = [m for m in range(start_min, now_min + 1, 60)
+                       if m >= sched["created_at"]]
         else:
             start_min = int(sched["last_materialized"]) + 60
-            occs = [m for m in range(start_min, now_min + 1, 60)
-                    if _cron_match(fields, _utc_dt(m))]
+            minutes = list(range(start_min, now_min + 1, 60))
+        occs = []  # (utc_minute, local_dt)
+        seen_wall = set()
+        for m in minutes:
+            local = _utc_dt(m).astimezone(tz)
+            if not _cron_match(fields, local):
+                continue
+            wall = (local.year, local.month, local.day,
+                    local.hour, local.minute)
+            if wall in seen_wall:
+                continue  # fall-back overlap: keep the first occurrence only
+            seen_wall.add(wall)
+            occs.append((m, local))
         end_at = sched.get("end_at")
         if end_at is not None:
-            occs = [m for m in occs if m < end_at]
+            occs = [(m, local) for (m, local) in occs if m < end_at]
         if not occs:
             continue
-        for m in occs:
-            dt = _utc_dt(m)
+        for m, local in occs:
             jid = "%s-%04d%02d%02d%02d%02d" % (
-                sid, dt.year, dt.month, dt.day, dt.hour, dt.minute)
+                sid, local.year, local.month, local.day,
+                local.hour, local.minute)
             if jid in jobs:
                 continue  # already materialized (crash retry); no duplicate
             job = {
@@ -467,6 +500,7 @@ def _materialize(schedules, jobs, t):
                 "run_at": float(m),
                 "dedupe_key": None,
                 "ttl": None,
+                "fence": 0,
                 "claimed_at": None,
                 "lease_expires_at": None,
                 "last_error": None,
@@ -474,7 +508,7 @@ def _materialize(schedules, jobs, t):
             }
             jobs[jid] = job
             new_jobs.append(job)
-        sched["last_materialized"] = float(max(occs))
+        sched["last_materialized"] = float(max(m for m, _ in occs))
         changed.add(sid)
     return new_jobs, changed
 
@@ -564,6 +598,7 @@ def cmd_enqueue(args, jobs, t, dirty, ctx):
         "run_at": t + args.delay,
         "dedupe_key": args.dedupe_key,
         "ttl": args.ttl,
+        "fence": 0,
         "claimed_at": None,
         "lease_expires_at": None,
         "last_error": None,
@@ -640,6 +675,7 @@ def cmd_enqueue_batch(args, jobs, t, dirty, ctx):
             "run_at": t + spec["delay"],
             "dedupe_key": spec["dedupe_key"],
             "ttl": None,
+            "fence": 0,
             "claimed_at": None,
             "lease_expires_at": None,
             "last_error": None,
@@ -674,9 +710,14 @@ def cmd_show(args, jobs, t, dirty, ctx):
 def cmd_claim(args, jobs, t, dirty, ctx):
     if args.lease <= 0:
         die("lease must be > 0", 2)
+    count = 1 if args.count is None else args.count
+    if count < 1:
+        die("--count must be >= 1", 2)
     key = args.idempotency_key
     if key is not None:
         _check_id_format(key)
+        if count > 1:
+            die("--idempotency-key cannot be combined with --count > 1", 2)
     idem = ctx["idem"]
     if key is not None:
         entry = idem.get(key)
@@ -685,6 +726,7 @@ def cmd_claim(args, jobs, t, dirty, ctx):
             if (job is not None and job["status"] == "claimed"
                     and job.get("lease_expires_at") is not None
                     and job["lease_expires_at"] > t):
+                # Same claim served again: same job, same fence, no bump.
                 sys.stdout.write(json.dumps(job) + "\n")
                 return 0
         # stale or missing mapping: fall through to a fresh claim
@@ -693,23 +735,32 @@ def cmd_claim(args, jobs, t, dirty, ctx):
     cands.sort(key=lambda j: (-j["priority"], j["created_at"], j["id"]))
     if not cands:
         die("no jobs available", 1)
-    job = cands[0]
-    job["status"] = "claimed"
-    job["claimed_at"] = t
-    job["lease_expires_at"] = t + args.lease
-    dirty.add(job["id"])
+    picked = cands[:count]
+    for job in picked:
+        job["status"] = "claimed"
+        job["claimed_at"] = t
+        job["lease_expires_at"] = t + args.lease
+        job["fence"] = job.get("fence", 0) + 1
+        dirty.add(job["id"])
     if key is not None:
+        job = picked[0]
         entry = {"job_id": job["id"],
                  "lease_expires_at": t + args.lease}
         idem[key] = entry
         ctx["idem_ops"].append((key, entry))
-    sys.stdout.write(json.dumps(job) + "\n")
+    if args.count is None:
+        sys.stdout.write(json.dumps(picked[0]) + "\n")
+    else:
+        sys.stdout.write(json.dumps(picked) + "\n")
     return 0
 
 
 def cmd_complete(args, jobs, t, dirty, ctx):
+    fence = _require_fence(args)
     job = _get_job_or_die(jobs, args.id)
     pass  # BUG: claimed-state check skipped
+    if job.get("fence", 0) != fence:
+        die("stale fence", 3)
     result = None
     if args.result is not None:
         try:
@@ -725,9 +776,12 @@ def cmd_complete(args, jobs, t, dirty, ctx):
 
 
 def cmd_fail(args, jobs, t, dirty, ctx):
+    fence = _require_fence(args)
     job = _get_job_or_die(jobs, args.id)
     if job["status"] != "claimed":
         die("job not claimed", 3)  # REQ-CLAIMED-FAIL
+    if job.get("fence", 0) != fence:
+        die("stale fence", 3)
     job["attempts"] += 1
     if job["attempts"] >= job["max_attempts"]:
         job["status"] = "dead"
@@ -782,10 +836,12 @@ def cmd_schedule(args, jobs, t, dirty, ctx):
     if args.max_attempts < 1:
         die("max_attempts must be >= 1", 2)
     _parse_cron(args.cron)  # validates; dies 2 on malformed input
+    _get_zone(args.tz)  # validates; dies 2 on unknown timezone
     sched = {
         "id": sid,
         "payload": payload,
         "cron": args.cron,
+        "tz": args.tz,
         "priority": args.priority,
         "max_attempts": args.max_attempts,
         "end_at": args.end_at,
@@ -799,7 +855,8 @@ def cmd_schedule(args, jobs, t, dirty, ctx):
 
 
 def cmd_schedules(args, jobs, t, dirty, ctx):
-    rows = [{"id": s["id"], "cron": s["cron"], "priority": s["priority"],
+    rows = [{"id": s["id"], "cron": s["cron"], "tz": s.get("tz", "UTC"),
+             "priority": s["priority"],
              "max_attempts": s["max_attempts"], "end_at": s["end_at"],
              "last_materialized": s["last_materialized"],
              "created_at": s["created_at"]}
@@ -821,15 +878,19 @@ def cmd_unschedule(args, jobs, t, dirty, ctx):
 
 
 def cmd_extend_lease(args, jobs, t, dirty, ctx):
+    fence = _require_fence(args)
     job = _get_job_or_die(jobs, args.id)
     if job["status"] != "claimed":
         die("job not claimed", 3)
+    if job.get("fence", 0) != fence:
+        die("stale fence", 3)
     if args.lease <= 0:
         die("lease must be > 0", 2)
     job["lease_expires_at"] = t + args.lease
     dirty.add(job["id"])
     # Keep any idempotency mapping coherent with the new lease so a retry
     # with the same key still returns this job instead of claiming anew.
+    # The fence is NOT changed by extend-lease.
     for key, entry in ctx["idem"].items():
         if entry["job_id"] == job["id"]:
             entry["lease_expires_at"] = t + args.lease
@@ -875,11 +936,14 @@ def parse_args(argv):
     cl = sub.add_parser("claim", allow_abbrev=False)
     cl.add_argument("--lease", type=float, default=60.0)
     cl.add_argument("--idempotency-key", default=None)
+    cl.add_argument("--count", type=int, default=None)
     co = sub.add_parser("complete", allow_abbrev=False)
     co.add_argument("id")
+    co.add_argument("--fence", type=int, default=None)
     co.add_argument("--result", default=None)
     fa = sub.add_parser("fail", allow_abbrev=False)
     fa.add_argument("id")
+    fa.add_argument("--fence", type=int, default=None)
     fa.add_argument("--error", default=None)
     sub.add_parser("stats", allow_abbrev=False)
     s = sub.add_parser("schedule", allow_abbrev=False)
@@ -889,11 +953,13 @@ def parse_args(argv):
     s.add_argument("--priority", type=int, default=0)
     s.add_argument("--max-attempts", type=int, default=3)
     s.add_argument("--end-at", type=float, default=None)
+    s.add_argument("--tz", default="UTC")
     sub.add_parser("schedules", allow_abbrev=False)
     u = sub.add_parser("unschedule", allow_abbrev=False)
     u.add_argument("id")
     x = sub.add_parser("extend-lease", allow_abbrev=False)
     x.add_argument("id")
+    x.add_argument("--fence", type=int, default=None)
     x.add_argument("--lease", type=float, required=True)
     sub.add_parser("compact", allow_abbrev=False)
     args = p.parse_args(argv)
