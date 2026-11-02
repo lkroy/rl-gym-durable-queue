@@ -59,6 +59,7 @@ Fields and defaults:
 | created_at         | epoch float       | time of enqueue                   |
 | run_at             | epoch float       | time of enqueue (+ delay)         |
 | dedupe_key         | string or null    | null                             |
+| ttl                | float or null     | null (no expiry)                   |
 | claimed_at         | float or null     | null                             |
 | lease_expires_at   | float or null     | null                             |
 | last_error         | string or null    | null                             |
@@ -66,13 +67,31 @@ Fields and defaults:
 
 `status` is one of `pending`, `claimed`, `done`, `dead`.
 
+## Pre-steps (run at the start of every command)
+
+Before executing any command, `q` MUST perform these steps in order, as
+one atomic unit with the command itself:
+
+1. **Materialize due schedule occurrences** (see `q schedule`): for each
+   schedule, create one pending job per occurrence with time <= now and
+   time > the schedule's `last_materialized`, then advance
+   `last_materialized` to the latest materialized occurrence.
+2. **Sweep expired leases**: any `claimed` job with
+   `lease_expires_at <= now` returns to `pending` (clearing `claimed_at`
+   / `lease_expires_at`), unless it is also past its TTL (see next step).
+   Idempotency mappings whose lease expired are discarded.
+3. **Sweep expired TTLs**: any job with a non-null `ttl` where
+   `now - created_at > ttl` and status is `pending` becomes `dead` with
+   `last_error` set to `"expired"`. A `claimed` job is exempt while its
+   lease is valid; if its lease has expired it is `dead` (not requeued).
+
 ## Commands
 
 All JSON printed to stdout MUST be parseable JSON. Validation failures MUST
 print a message to stderr.
 
 - `q enqueue --payload JSON [--priority INT] [--delay SEC] [--id ID]
-  [--dedupe-key KEY] [--max-attempts N]`
+  [--dedupe-key KEY] [--max-attempts N] [--ttl SEC]`
   - On success: print the job id followed by a newline to stdout, exit 0.
   - `--payload` MUST be valid JSON, otherwise exit 2.
   - `--id`, when given, MUST match `^[A-Za-z0-9_-]{1,64}$`, otherwise exit 2.
@@ -80,6 +99,9 @@ print a message to stderr.
   - `--delay` MUST NOT be negative, otherwise exit 2. `run_at` is set to
     `created_at + delay` (default delay 0).
   - `--max-attempts` MUST be >= 1, otherwise exit 2.
+  - `--ttl`, when given, MUST be > 0, otherwise exit 2. The job expires
+    `ttl` seconds after `created_at` (see pre-step 3). A delayed job can
+    expire before ever becoming claimable.
   - Dedupe: if `--dedupe-key` is given and a job with the same key exists
     with status `pending` or `claimed`, print THAT job's id, exit 0, and
     create nothing. A key whose previous job is `done` (or `dead`) does NOT
@@ -118,10 +140,7 @@ print a message to stderr.
   - `--lease` MUST be > 0, otherwise exit 2.
   - `--idempotency-key`, when given, MUST match `^[A-Za-z0-9_-]{1,64}$`,
     otherwise exit 2.
-  - First, sweep expired leases: any job with status `claimed` and
-    `lease_expires_at <= now` returns to `pending`, with `claimed_at` and
-    `lease_expires_at` cleared. Idempotency mappings whose lease has
-    expired are discarded in the same sweep.
+  - The pre-steps run first (materialization, lease sweep, TTL sweep).
   - If KEY is given and maps to a job that is currently `claimed` with an
     unexpired lease, return THAT job (full JSON), exit 0. Do NOT claim a
     new job and do NOT extend the lease. This gives exactly-once delivery
@@ -159,6 +178,54 @@ print a message to stderr.
 
 - `q stats`
   - Print `{"pending":n,"claimed":n,"done":n,"dead":n,"total":n}`, exit 0.
+
+- `q schedule --payload JSON --cron EXPR [--id ID] [--priority INT]
+  [--max-attempts N] [--end-at EPOCH]`
+  - Creates a recurring schedule. `--payload` MUST be valid JSON,
+    otherwise exit 2. `--id`, when given, MUST match
+    `^[A-Za-z0-9_-]{1,64}$` and MUST NOT duplicate an existing schedule
+    id, otherwise exit 2. `--max-attempts` MUST be >= 1, otherwise exit 2.
+  - `--cron` is a 5-field expression `minute hour dom month dow`
+    evaluated in UTC. Each field accepts `*`, `*/step`, `a-b`,
+    `a-b/step`, `a,b,c`, or a single value. Ranges: minute 0-59, hour
+    0-23, dom 1-31, month 1-12, dow 0-6 (0 and 7 both mean Sunday). Any
+    malformed field or out-of-range value → exit 2. A date that never
+    exists (e.g. Feb 30) simply never matches.
+  - Matching rule: an occurrence exists at each minute where minute,
+    hour and month match, and (dom matches OR dow matches) — with the
+    standard refinement that if one of dom/dow is `*` (unrestricted),
+    the other alone decides.
+  - `--end-at`, when given, is an epoch timestamp: occurrences at or
+    after it are never materialized.
+  - On success: print the schedule id, exit 0.
+
+- `q schedules`
+  - Print a JSON array of schedule summaries, one per schedule:
+    `{"id","cron","priority","max_attempts","end_at","last_materialized",
+    "created_at"}` (`end_at`/`last_materialized` null when unset).
+    Exit 0.
+
+- `q unschedule ID`
+  - Unknown schedule id: exit 4. Remove the schedule (jobs already
+    materialized from it are NOT removed). Print the schedule id,
+    exit 0.
+
+- Materialized occurrences: each due occurrence becomes a regular job
+  with `run_at` = occurrence time, `created_at` = materialization time,
+  and the schedule's `priority`/`max_attempts`. Its id is
+  `{schedule_id}-{YYYYMMDDHHMM}` (UTC), which makes materialization
+  idempotent: re-running it after a crash MUST NOT create duplicates,
+  and `last_materialized` MUST advance atomically with the created jobs
+  so no occurrence is skipped. On the first materialization, only
+  occurrences at or after the schedule's creation time are considered
+  (no backfill from before the schedule existed).
+
+- `q extend-lease ID --lease SEC`
+  - Unknown id: exit 4.
+  - The job MUST have status `claimed`, otherwise stderr MUST contain
+    `not claimed` and exit 3.
+  - `--lease` MUST be > 0, otherwise exit 2.
+  - Set `lease_expires_at = now + lease`. Print the job id, exit 0.
 
 - `q compact`
   - Reclaim space used by the redundant storage: rewrite the durable state
