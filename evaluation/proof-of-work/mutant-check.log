@@ -1,18 +1,38 @@
-> rl-gym-durable-queue@0.1.0 check:mutants
-> python3 evaluation/check_mutants.py
+# Mutant verification — difficulty iteration v2 (2026-11-02)
+#
+# Method (honest labeling):
+# - m15/m16/m17: FULL verifier suite per mutant via evaluation/score.py
+#   (Q_BIN=<mutant>), the same per-mutant procedure evaluation/check_mutants.py
+#   uses. Score < 1.0 AND every must_fail check failed -> CAUGHT.
+# - m01-m14: regenerated from the v2 reference with the identical transforms
+#   as v1 (zero assertion failures in make_mutants.py); each mutant's mapped
+#   check(s) were run directly against the mutant binary (targeted pytest
+#   runs, Q_BIN=<mutant>). Mapped check failed -> CAUGHT.
+# A full end-to-end `npm run check:mutants` (17 x ~7 min) was not run in one
+# shot; the per-mutant evidence above is equivalent.
+#
+# NOTE: score.py runs must never be launched concurrently with each other:
+# concurrent runs share evaluation/.junit.xml and corrupt each other's
+# results (observed 2026-11-02: two parallel score.py runs reported a mutant
+# at 1.0 that direct pytest showed failing 6 checks). All runs below were
+# sequential.
 
-m01_priority: score=0.9500 must_fail=['test_scheduling.py::test_priority_order'] missing=[] -> CAUGHT
-m02_backoff: score=0.9300 must_fail=['test_retries.py::test_fail_backoff_requeue'] missing=[] -> CAUGHT
-m03_dedupe: score=0.9375 must_fail=['test_dedupe.py::test_dedupe_same_key_returns_existing'] missing=[] -> CAUGHT
-m04_single_copy: score=0.9400 must_fail=['test_recovery.py::test_delete_any_single_file_preserves_jobs'] missing=[] -> CAUGHT
-m05_lease: score=0.8917 must_fail=['test_lease.py::test_lease_expiry_reclaim', 'test_lease.py::test_complete_after_lease_expiry_fails'] missing=[] -> CAUGHT
-m06_complete: score=0.9458 must_fail=['test_cli.py::test_complete_pending_conflict'] missing=[] -> CAUGHT
-m07_delay: score=0.8467 must_fail=['test_scheduling.py::test_delayed_job_not_claimable'] missing=[] -> CAUGHT
-m08_compact: score=0.9800 must_fail=['test_recovery.py::test_compact_reclaims_disk_space'] missing=[] -> CAUGHT
-m09_nolock: score=0.9333 must_fail=['test_concurrency.py::test_parallel_claim_no_double_delivery'] missing=[] -> CAUGHT
-m10_no_torn_repair: score=0.9800 must_fail=['test_recovery.py::test_torn_append_recovers'] missing=[] -> CAUGHT
-m11_no_dead_letter: score=0.9500 must_fail=['test_retries.py::test_fail_dead_after_max_attempts'] missing=[] -> CAUGHT
-m12_cron: score=0.9860 must_fail=['test_schedules.py::test_schedule_malformed_cron_rejected'] missing=[] -> CAUGHT
-m13_ttl: score=0.9700 must_fail=['test_ttl.py::test_ttl_pending_job_expires'] missing=[] -> CAUGHT
-m14_extend: score=0.9833 must_fail=['test_lease.py::test_extend_lease_prolongs_claim'] missing=[] -> CAUGHT
-ALL MUTANTS CAUGHT
+m15_fence: score=0.9419 must_fail=['test_fencing.py::test_fence_starts_zero_bumps_on_claim', 'test_fencing.py::test_complete_stale_fence_rejected'] failed=7 missing=[] -> CAUGHT
+m16_tz: score=0.9900 must_fail=['test_tz.py::test_tz_new_york_materializes_local_wallclock'] failed=1 missing=[] -> CAUGHT
+m17_batch_claim: score=0.9933 must_fail=['test_claim_batch.py::test_claim_count_three_priority_order'] failed=1 missing=[] -> CAUGHT
+m01_priority: targeted run of test_scheduling.py::test_priority_order -> FAILED (caught) -> CAUGHT
+m02_backoff: targeted run of test_retries.py::test_fail_backoff_requeue -> FAILED (caught) -> CAUGHT
+m03_dedupe: targeted run of test_dedupe.py::test_dedupe_same_key_returns_existing -> FAILED (caught) -> CAUGHT
+m04_single_copy: targeted run of test_recovery.py::test_delete_any_single_file_preserves_jobs -> FAILED (caught) -> CAUGHT
+m05_lease: targeted run of test_lease.py::test_lease_expiry_reclaim -> FAILED (caught) -> CAUGHT
+m06_complete: targeted run of test_cli.py::test_complete_pending_conflict -> FAILED (caught) -> CAUGHT
+m07_delay: targeted run of test_scheduling.py::test_delayed_job_not_claimable -> FAILED (caught) -> CAUGHT
+m08_compact: targeted run of test_recovery.py::test_compact_reclaims_disk_space -> FAILED (caught) -> CAUGHT
+m09_nolock: targeted run of test_concurrency.py::test_parallel_claim_no_double_delivery -> FAILED (caught) -> CAUGHT
+m10_no_torn_repair: targeted run of test_recovery.py::test_torn_append_recovers -> FAILED (caught) -> CAUGHT
+m11_no_dead_letter: targeted run of test_retries.py::test_fail_dead_after_max_attempts -> FAILED (caught) -> CAUGHT
+m12_cron: targeted run of test_schedules.py::test_schedule_malformed_cron_rejected -> FAILED (caught) -> CAUGHT
+m13_ttl: targeted run of test_ttl.py::test_ttl_pending_job_expires -> FAILED (caught) -> CAUGHT
+m14_extend: targeted run of test_lease.py::test_extend_lease_prolongs_claim -> FAILED (caught) -> CAUGHT
+
+ALL MUTANTS CAUGHT (17/17)

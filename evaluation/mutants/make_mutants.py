@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the 14 mutant copies of reference/q (one realistic bug each).
+"""Generate the 17 mutant copies of reference/q (one realistic bug each).
 
 Run from the repo root: python3 evaluation/mutants/make_mutants.py
 Idempotent: rewrites evaluation/mutants/m0* and mutants.yml.
@@ -199,6 +199,42 @@ mutant("m14_extend",
            "    pass  # BUG: lease never extended\n"
            "    dirty.add(job[\"id\"])\n"
            "    # Keep any idempotency mapping coherent with the new lease so a retry"))
+
+
+# 15. claim never increments the fence token: stale-fence protection can never fire
+mutant("m15_fence",
+       "claim never increments the fence token (stays 0); stale-fence "
+       "protection can never fire",
+       ["test_fencing.py::test_fence_starts_zero_bumps_on_claim",
+        "test_fencing.py::test_complete_stale_fence_rejected"],
+       lambda s: sub_once(
+           s,
+           "        job[\"fence\"] = job.get(\"fence\", 0) + 1",
+           "        pass  # BUG: fence never incremented"))
+
+
+# 16. schedule ignores --tz: cron always evaluated in UTC
+mutant("m16_tz",
+       "schedule ignores --tz; cron is always evaluated in UTC",
+       ["test_tz.py::test_tz_new_york_materializes_local_wallclock"],
+       lambda s: sub_once(
+           s,
+           "        tz = _get_zone(sched.get(\"tz\", \"UTC\"))",
+           "        tz = _get_zone(\"UTC\")  # BUG: --tz ignored"))
+
+
+# 17. batch claim ignores priority: only the multi-claim path is wrong
+mutant("m17_batch_claim",
+       "claim --count N orders by created_at only, ignoring priority "
+       "(single-claim path unaffected)",
+       ["test_claim_batch.py::test_claim_count_three_priority_order"],
+       lambda s: sub_once(
+           s,
+           "    cands.sort(key=lambda j: (-j[\"priority\"], j[\"created_at\"], j[\"id\"]))",
+           "    if count == 1:\n"
+           "        cands.sort(key=lambda j: (-j[\"priority\"], j[\"created_at\"], j[\"id\"]))\n"
+           "    else:\n"
+           "        cands.sort(key=lambda j: (j[\"created_at\"], j[\"id\"]))  # BUG: batch claim ignores priority"))
 
 
 def main():

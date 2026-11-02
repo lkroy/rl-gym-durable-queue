@@ -42,7 +42,7 @@ def test_idempotency_key_discarded_after_complete(q):
     q.run("enqueue", "--payload", "{}", "--id", "d2")
     first = q.json("claim", "--idempotency-key", "K3")
     assert first["id"] == "d1"
-    cp = q.run("complete", "d1")
+    cp = q.run("complete", "d1", "--fence", str(first["fence"]))
     assert cp.returncode == 0, cp.stderr
     # d1 is done: the mapping is discarded, so the key starts fresh...
     second = q.json("claim", "--idempotency-key", "K3")

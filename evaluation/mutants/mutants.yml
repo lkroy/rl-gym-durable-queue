@@ -72,3 +72,21 @@ mutants:
     file: m14_extend
     must_fail:
     - test_lease.py::test_extend_lease_prolongs_claim
+  m15_fence:
+    bug: claim never increments the fence token (stays 0); stale-fence protection
+      can never fire
+    file: m15_fence
+    must_fail:
+    - test_fencing.py::test_fence_starts_zero_bumps_on_claim
+    - test_fencing.py::test_complete_stale_fence_rejected
+  m16_tz:
+    bug: schedule ignores --tz; cron is always evaluated in UTC
+    file: m16_tz
+    must_fail:
+    - test_tz.py::test_tz_new_york_materializes_local_wallclock
+  m17_batch_claim:
+    bug: claim --count N orders by created_at only, ignoring priority (single-claim
+      path unaffected)
+    file: m17_batch_claim
+    must_fail:
+    - test_claim_batch.py::test_claim_count_three_priority_order

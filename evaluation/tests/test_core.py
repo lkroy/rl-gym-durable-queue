@@ -26,6 +26,7 @@ def test_show_roundtrips_payload(q):
     assert job["claimed_at"] is None
     assert job["lease_expires_at"] is None
     assert job["last_error"] is None
+    assert job["fence"] == 0
     assert job["result"] is None
     assert isinstance(job["created_at"], float)
     assert isinstance(job["run_at"], float)
@@ -53,7 +54,8 @@ def test_claim_complete_flow(q):
     assert job["status"] == "claimed"
     assert job["claimed_at"] is not None
     assert job["lease_expires_at"] > job["claimed_at"]
-    cp = q.run("complete", "flow1", "--result", '{"ok": true}')
+    cp = q.run("complete", "flow1", "--fence", str(job["fence"]),
+               "--result", '{"ok": true}')
     assert cp.returncode == 0
     assert cp.stdout.strip() == "flow1"
     job = q.json("show", "flow1")
@@ -64,8 +66,8 @@ def test_claim_complete_flow(q):
 def test_stats_counts(q):
     q.run("enqueue", "--payload", "1", "--id", "s1")
     q.run("enqueue", "--payload", "2", "--id", "s2")
-    q.json("claim")  # claims s1
-    q.run("complete", "s1")
+    job = q.json("claim")  # claims s1
+    q.run("complete", "s1", "--fence", str(job["fence"]))
     assert q.json("stats") == {"pending": 1, "claimed": 0, "done": 1,
                                "dead": 0, "total": 2}
 

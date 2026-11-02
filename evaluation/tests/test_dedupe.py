@@ -12,8 +12,8 @@ def test_dedupe_same_key_returns_existing(q):
 
 def test_dedupe_key_reusable_after_done(q):
     id1 = q.run("enqueue", "--payload", "{}", "--dedupe-key", "k2").stdout.strip()
-    q.json("claim")
-    q.run("complete", id1)
+    job = q.json("claim")
+    q.run("complete", id1, "--fence", str(job["fence"]))
     cp = q.run("enqueue", "--payload", "{}", "--dedupe-key", "k2")
     assert cp.returncode == 0
     id2 = cp.stdout.strip()

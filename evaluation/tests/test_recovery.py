@@ -166,11 +166,12 @@ def test_compact_reclaims_disk_space(q):
     # churn: claim/complete/fail so the redundant storage grows
     for _ in range(10):
         job = q.json("claim")
-        cp = q.run("complete", job["id"])
+        cp = q.run("complete", job["id"], "--fence", str(job["fence"]))
         assert cp.returncode == 0, cp.stderr
     for _ in range(5):
         job = q.json("claim")
-        cp = q.run("fail", job["id"], "--error", "boom")
+        cp = q.run("fail", job["id"], "--fence", str(job["fence"]),
+                   "--error", "boom")
         assert cp.returncode == 0, cp.stderr
     before = _dir_bytes(q.qdata)
     cp = q.run("compact")

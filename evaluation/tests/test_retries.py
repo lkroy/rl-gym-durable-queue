@@ -4,9 +4,9 @@ import time
 
 def test_fail_backoff_requeue(q):
     q.run("enqueue", "--payload", "{}", "--id", "r1", "--max-attempts", "2")
-    q.json("claim")
+    job = q.json("claim")
     before = time.time()
-    cp = q.run("fail", "r1", "--error", "boom")
+    cp = q.run("fail", "r1", "--fence", str(job["fence"]), "--error", "boom")
     assert cp.returncode == 0
     assert cp.stdout.strip() == "r1"
     job = q.json("show", "r1")
@@ -23,8 +23,8 @@ def test_fail_backoff_requeue(q):
 
 def test_fail_dead_after_max_attempts(q):
     q.run("enqueue", "--payload", "{}", "--id", "d1", "--max-attempts", "1")
-    q.json("claim")
-    cp = q.run("fail", "d1", "--error", "fatal")
+    job = q.json("claim")
+    cp = q.run("fail", "d1", "--fence", str(job["fence"]), "--error", "fatal")
     assert cp.returncode == 0
     job = q.json("show", "d1")
     assert job["status"] == "dead"
@@ -35,6 +35,6 @@ def test_fail_dead_after_max_attempts(q):
 
 def test_fail_pending_conflict(q):
     q.run("enqueue", "--payload", "{}", "--id", "p1")
-    cp = q.run("fail", "p1")
+    cp = q.run("fail", "p1", "--fence", "0")
     assert cp.returncode == 3
     assert "not claimed" in cp.stderr

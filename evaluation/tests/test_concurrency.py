@@ -65,8 +65,10 @@ def test_parallel_mixed_ops_keep_queue_consistent(q):
             assert c.returncode in (0, 1), c.stderr
             if c.returncode == 1:
                 break
-            jid = json.loads(c.stdout)["id"]
-            d = subprocess.run([q.q_bin, "complete", jid],
+            claim_out = json.loads(c.stdout)
+            jid = claim_out["id"]
+            d = subprocess.run([q.q_bin, "complete", jid, "--fence",
+                                str(claim_out["fence"])],
                                capture_output=True, text=True,
                                env=env, timeout=60)
             assert d.returncode == 0, \

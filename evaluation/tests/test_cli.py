@@ -31,7 +31,7 @@ def test_zero_lease(q):
 
 def test_complete_pending_conflict(q):
     q.run("enqueue", "--payload", "{}", "--id", "pc1")
-    cp = q.run("complete", "pc1")
+    cp = q.run("complete", "pc1", "--fence", "0")
     assert cp.returncode == 3
     assert "not claimed" in cp.stderr
 
