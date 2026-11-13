@@ -227,3 +227,95 @@ def test_parallel_claim_mixed_tags_no_double_delivery(q):
     assert len(tagged) == 4, tagged
     assert len(set(tagged)) == 4, "double delivery tagged: %s" % tagged
     assert set(untagged).isdisjoint(set(tagged))
+
+
+def test_kill_mid_batch_with_deps_all_or_nothing(q):
+    """SIGKILL mid enqueue-batch with depends_on: all-or-nothing + graph intact."""
+    q.run("enqueue", "--payload", "{}", "--id", "root")
+    jobs = json.dumps([
+        {"payload": {"i": i}, "id": "b%d" % i, "depends_on": ["root"]}
+        for i in range(12)
+    ])
+    env = dict(os.environ, QDATA_DIR=q.qdata)
+    before = {r["id"] for r in q.json("list")}
+    procs = []
+    for _ in range(6):
+        procs.append(subprocess.Popen(
+            [q.q_bin, "enqueue-batch", "--jobs", jobs],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env))
+        time.sleep(0.004)
+    time.sleep(0.002)
+    for p in procs:
+        if p.poll() is None:
+            p.kill()
+    for p in procs:
+        p.wait()
+    cp = q.run("stats")
+    assert cp.returncode == 0, cp.stderr
+    after = {r["id"] for r in q.json("list")}
+    # Either none of the batch ids, or all 12 — never a partial batch.
+    batch_ids = {"b%d" % i for i in range(12)}
+    present = after & batch_ids
+    assert present in (set(), batch_ids), "partial batch survived kill: %s" % present
+    assert "root" in after
+    if present == batch_ids:
+        for jid in batch_ids:
+            assert q.json("show", jid)["depends_on"] == ["root"]
+
+
+def test_file_loss_preserves_pause_and_drain(q):
+    """Deleting any one state file must keep pause+drain meta observable."""
+    import shutil
+    q.run("enqueue", "--payload", "{}", "--id", "keep")
+    q.run("pause")
+    q.run("drain")
+    victims = []
+    for root, _dirs, files in os.walk(q.qdata):
+        for f in files:
+            p = os.path.join(root, f)
+            if os.path.isfile(p) and not os.path.islink(p):
+                victims.append(os.path.relpath(p, q.qdata))
+    assert victims
+    for victim in victims:
+        alt = q.qdata + "-meta-" + victim.replace("/", "_")
+        shutil.rmtree(alt, ignore_errors=True)
+        shutil.copytree(q.qdata, alt)
+        os.remove(os.path.join(alt, victim))
+        env = dict(os.environ, QDATA_DIR=alt)
+        # pause still blocks claim
+        cp = subprocess.run([q.q_bin, "claim"], capture_output=True,
+                            text=True, env=env, timeout=60)
+        assert cp.returncode == 1, (victim, cp.returncode, cp.stderr)
+        assert "queue paused" in cp.stderr, (victim, cp.stderr)
+        # drain still blocks enqueue
+        cp = subprocess.run(
+            [q.q_bin, "enqueue", "--payload", "{}", "--id", "x-" + victim.replace("/", "")[:8]],
+            capture_output=True, text=True, env=env, timeout=60)
+        assert cp.returncode == 3, (victim, cp.returncode, cp.stderr)
+        assert "draining" in cp.stderr, (victim, cp.stderr)
+        shutil.rmtree(alt, ignore_errors=True)
+
+
+def test_fail_dep_then_reclaim_fence_blocks_stale_complete(q):
+    """Dep fail/reclaim bumps fence; stale worker complete must not unblock dependents."""
+    q.run("enqueue", "--payload", "{}", "--id", "D")
+    q.run("enqueue", "--payload", "{}", "--id", "C", "--depends-on", "D")
+    first = q.json("claim", "--lease", "1")
+    assert first["id"] == "D"
+    stale_fence = first["fence"]
+    time.sleep(1.6)
+    # Lease expired; another worker reclaims
+    second = q.json("claim", "--lease", "30")
+    assert second["id"] == "D"
+    assert second["fence"] == stale_fence + 1
+    # Stale complete rejected
+    cp = q.run("complete", "D", "--fence", str(stale_fence))
+    assert cp.returncode == 3
+    assert "stale fence" in cp.stderr
+    # Dependent still blocked
+    cp = q.run("claim")
+    assert cp.returncode == 1
+    # Live worker completes → dependent becomes claimable
+    q.run("complete", "D", "--fence", str(second["fence"]))
+    child = q.json("claim")
+    assert child["id"] == "C"

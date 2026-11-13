@@ -44,9 +44,8 @@ npm run generate          # real OpenHands model run (needs LLM_API_KEY)
 
 ## Scoring
 
-Weights (sum = 1.0): interactions 0.18, deps 0.12, pause 0.07, cancel 0.07,
-drain 0.07, tags 0.06, recovery 0.07, concurrency 0.06, fencing 0.06,
-retries 0.04, lease 0.04, schedules 0.03, tz 0.02, ttl 0.02, scheduling 0.02,
-idempotency 0.02, batch 0.01, claim_batch 0.01, cli 0.01, dedupe 0.01,
-core 0.01.
+Weights (sum = 1.0) put ~86% on hard domains: interactions 0.14, recovery 0.14,
+concurrency 0.12, fencing 0.08, deps 0.08, drain 0.06, tags 0.06, pause 0.05,
+cancel 0.05, retries 0.04, lease 0.04; remaining ~14% on schedules/tz/ttl/
+scheduling/idempotency/batch/claim_batch/cli/dedupe/core.
 Per category: fraction of its checks passed x weight.

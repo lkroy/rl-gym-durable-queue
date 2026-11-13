@@ -1,18 +1,23 @@
 # Weighted scoring for the durable-queue RL Gym task.
 # Weights MUST sum to exactly 1.0 (asserted by evaluation/score.py).
+#
+# Easy surface (core/cli/dedupe/batch/...) is intentionally tiny (~0.10).
+# Most weight is on crash safety, races, fencing, and cross-feature
+# interactions — the failure modes strong agentic models still miss even
+# when they implement the happy-path commands.
 weights:
-  interactions: 0.18
-  deps: 0.12
-  pause: 0.07
-  cancel: 0.07
-  drain: 0.07
+  interactions: 0.14
+  recovery: 0.14
+  concurrency: 0.12
+  fencing: 0.08
+  deps: 0.08
+  drain: 0.06
   tags: 0.06
-  recovery: 0.07
-  concurrency: 0.06
-  fencing: 0.06
+  pause: 0.05
+  cancel: 0.05
   retries: 0.04
   lease: 0.04
-  schedules: 0.03
+  schedules: 0.02
   tz: 0.02
   ttl: 0.02
   scheduling: 0.02
@@ -20,8 +25,8 @@ weights:
   batch: 0.01
   claim_batch: 0.01
   cli: 0.01
-  dedupe: 0.01
-  core: 0.01
+  dedupe: 0.005
+  core: 0.005
 
 # Each category maps to the pytest file whose checks it owns.
 files:
