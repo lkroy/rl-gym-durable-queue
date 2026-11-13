@@ -1,0 +1,25 @@
+
+> rl-gym-durable-queue@0.1.0 check:mutants
+> python3 evaluation/check_mutants.py
+
+m01_priority: must_fail=['test_scheduling.py::test_priority_order'] missing=[] -> CAUGHT
+m02_backoff: must_fail=['test_retries.py::test_fail_backoff_requeue'] missing=[] -> CAUGHT
+m03_dedupe: must_fail=['test_dedupe.py::test_dedupe_same_key_returns_existing'] missing=[] -> CAUGHT
+m04_single_copy: must_fail=['test_recovery.py::test_delete_any_single_file_preserves_jobs'] missing=[] -> CAUGHT
+m05_lease: must_fail=['test_lease.py::test_lease_expiry_reclaim', 'test_lease.py::test_complete_after_lease_expiry_fails'] missing=[] -> CAUGHT
+m06_complete: must_fail=['test_cli.py::test_complete_pending_conflict'] missing=[] -> CAUGHT
+m07_delay: must_fail=['test_scheduling.py::test_delayed_job_not_claimable'] missing=[] -> CAUGHT
+m08_compact: must_fail=['test_recovery.py::test_compact_reclaims_disk_space'] missing=[] -> CAUGHT
+m09_nolock: must_fail=['test_concurrency.py::test_parallel_claim_no_double_delivery'] missing=[] -> CAUGHT
+m10_no_torn_repair: must_fail=['test_recovery.py::test_torn_append_recovers'] missing=[] -> CAUGHT
+m11_no_dead_letter: must_fail=['test_retries.py::test_fail_dead_after_max_attempts'] missing=[] -> CAUGHT
+m12_cron: must_fail=['test_schedules.py::test_schedule_malformed_cron_rejected'] missing=[] -> CAUGHT
+m13_ttl: must_fail=['test_ttl.py::test_ttl_pending_job_expires'] missing=[] -> CAUGHT
+m14_extend: must_fail=['test_lease.py::test_extend_lease_prolongs_claim'] missing=[] -> CAUGHT
+m15_fence: must_fail=['test_fencing.py::test_fence_starts_zero_bumps_on_claim', 'test_fencing.py::test_complete_stale_fence_rejected'] missing=[] -> CAUGHT
+m16_tz: must_fail=['test_tz.py::test_tz_new_york_materializes_local_wallclock'] missing=[] -> CAUGHT
+m17_batch_claim: must_fail=['test_claim_batch.py::test_claim_count_three_priority_order'] missing=[] -> CAUGHT
+m18_deps: must_fail=['test_deps.py::test_blocked_until_dependency_done'] missing=[] -> CAUGHT
+m19_pause: must_fail=['test_pause.py::test_pause_survives_new_process'] missing=[] -> CAUGHT
+m20_cascade: must_fail=['test_cancel.py::test_cascade_cancels_transitive_pending'] missing=[] -> CAUGHT
+ALL MUTANTS CAUGHT

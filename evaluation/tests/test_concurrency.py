@@ -2,6 +2,7 @@
 import json
 import os
 import subprocess
+import time
 
 
 def test_parallel_claim_no_double_delivery(q):
@@ -85,3 +86,66 @@ def test_parallel_mixed_ops_keep_queue_consistent(q):
     assert stats["done"] == 10, stats
     assert stats["pending"] == 0 and stats["claimed"] == 0, stats
     assert stats["total"] == 10, stats
+
+
+def test_parallel_drain_vs_enqueue_is_consistent(q):
+    """Concurrent drain + enqueue: every enqueue is either accepted or draining."""
+    env = dict(os.environ, QDATA_DIR=q.qdata)
+    # Seed so the queue is non-empty
+    q.run("enqueue", "--payload", "{}", "--id", "seed")
+    procs = []
+    for i in range(10):
+        procs.append(subprocess.Popen(
+            [q.q_bin, "enqueue", "--payload", "{}", "--id", "e%d" % i],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env))
+        if i == 3:
+            procs.append(subprocess.Popen(
+                [q.q_bin, "drain"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env))
+        time.sleep(0.002)
+    accepted, rejected = [], []
+    drain_ok = False
+    for p in procs:
+        out, err = p.communicate(timeout=60)
+        if "drain" in " ".join(p.args):
+            assert p.returncode == 0, err
+            drain_ok = True
+            continue
+        if p.returncode == 0:
+            accepted.append(out.strip())
+        else:
+            assert p.returncode == 3, (p.returncode, err)
+            assert "draining" in err
+            rejected.append(p.args[-1])
+    assert drain_ok
+    # After all settle, new enqueue must be rejected
+    cp = q.run("enqueue", "--payload", "{}", "--id", "late")
+    assert cp.returncode == 3
+    assert "draining" in cp.stderr
+    ids = {r["id"] for r in q.json("list")}
+    assert "seed" in ids
+    for jid in accepted:
+        assert jid in ids
+    for jid in rejected:
+        assert jid not in ids
+
+
+def test_parallel_claim_with_deps_no_premature(q):
+    """Parallel claimers must not deliver a dependent before its dep is done."""
+    q.run("enqueue", "--payload", "{}", "--id", "dep")
+    for i in range(5):
+        q.run("enqueue", "--payload", "{}", "--id", "c%d" % i,
+              "--depends-on", "dep", "--priority", "10")
+    env = dict(os.environ, QDATA_DIR=q.qdata)
+    procs = [subprocess.Popen(
+        [q.q_bin, "claim"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, env=env) for _ in range(8)]
+    claimed = []
+    for p in procs:
+        out, err = p.communicate(timeout=60)
+        if p.returncode == 0:
+            claimed.append(json.loads(out)["id"])
+        else:
+            assert p.returncode == 1, err
+    # Only the dependency is claimable; at most one process gets it
+    assert claimed == ["dep"], claimed

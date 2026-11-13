@@ -1,0 +1,1375 @@
+#!/usr/bin/env python3
+"""q - a durable, crash-safe job queue CLI (reference implementation).
+
+Standard library only. All state lives under $QDATA_DIR (default ./.qdata).
+
+Every command conceptually: lock, load (snapshot + WAL replay + torn-tail
+truncation), sweep expired leases (jobs and idempotency mappings), execute,
+append WAL ops in ONE fsync'd write (a batch is a single WAL record, so a
+kill mid-batch leaves all or none of its jobs), rewrite the snapshot
+atomically (tmp + fsync + rename), unlock.
+"""
+
+import argparse
+import datetime
+import fcntl
+import json
+import os
+import re
+import secrets
+import sys
+import time
+import zoneinfo
+
+ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+TAG_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+STATUSES = ("pending", "claimed", "done", "dead")
+
+
+def die(msg, code):
+    sys.stderr.write(str(msg) + "\n")
+    sys.exit(code)
+
+
+def _get_zone(name):
+    try:
+        return zoneinfo.ZoneInfo(name)
+    except Exception:
+        die("unknown timezone: %s" % name, 2)
+
+
+def _require_fence(args):
+    f = args.fence
+    if f is None or not isinstance(f, int) or f < 0:
+        die("fence is required and must be a non-negative integer", 2)
+    return f
+
+
+def data_dir():
+    return os.environ.get("QDATA_DIR", "./.qdata")
+
+
+def utcnow():
+    return time.time()
+
+
+# ------------------------------------------------------------- persistence ---
+
+def _acquire_lock(dirpath):
+    os.makedirs(dirpath, exist_ok=True)
+    fh = open(os.path.join(dirpath, ".lock"), "a")
+    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+    return fh
+
+
+def _fsync_dir(dirpath):
+    try:
+        fd = os.open(dirpath, os.O_DIRECTORY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _well_formed_op(obj):
+    if not isinstance(obj, dict):
+        return False
+    op = obj.get("op")
+    if op == "upsert":
+        return (isinstance(obj.get("job"), dict)
+                and bool(obj["job"].get("id")))
+    if op == "upsert_batch":
+        jobs = obj.get("jobs")
+        return (isinstance(jobs, list)
+                and all(isinstance(j, dict) and j.get("id") for j in jobs))
+    if op == "idem":
+        return (isinstance(obj.get("key"), str)
+                and isinstance(obj.get("job_id"), str))
+    if op == "idem_del":
+        return isinstance(obj.get("key"), str)
+    if op == "sched":
+        return (isinstance(obj.get("sched"), dict)
+                and bool(obj["sched"].get("id")))
+    if op == "sched_del":
+        return isinstance(obj.get("id"), str)
+    if op == "meta":
+        return isinstance(obj.get("meta"), dict)
+    return False
+
+
+def _truncate_torn_tail(path):
+    """Drop a trailing partial/corrupt WAL segment. Return True if truncated.
+
+    A torn tail is any trailing bytes after the last newline (a writer that
+    crashed mid-line) or a line that is not a well-formed op record.
+    Everything from the first bad byte onward is discarded.
+    """
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        return False
+    if not data:
+        return False
+    orig_len = len(data)
+    if not data.endswith(b"\n"):
+        idx = data.rfind(b"\n")
+        data = data[: idx + 1] if idx >= 0 else b""
+    good_end = len(data)
+    off = 0
+    for chunk in data.split(b"\n"):
+        if not chunk:
+            off += 1
+            continue
+        try:
+            obj = json.loads(chunk.decode("utf-8"))
+        except Exception:
+            good_end = off
+            break
+        if not _well_formed_op(obj):
+            good_end = off
+            break
+        off += len(chunk) + 1
+    if good_end < orig_len:
+        with open(path, "r+b") as f:
+            f.truncate(good_end)
+            f.flush()
+            os.fsync(f.fileno())
+        _fsync_dir(os.path.dirname(path) or ".")
+        return True
+    return False
+
+
+def _load_snapshot(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+    jobs = obj.get("jobs") if isinstance(obj, dict) else None
+    if not isinstance(jobs, dict):
+        return {}
+    clean = {}
+    for key, val in jobs.items():
+        if isinstance(val, dict) and val.get("id") == key:
+            clean[key] = val
+    return clean
+
+
+def _load_idem_snapshot(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+    idem = obj.get("idem") if isinstance(obj, dict) else None
+    if not isinstance(idem, dict):
+        return {}
+    clean = {}
+    for key, val in idem.items():
+        if (isinstance(key, str) and isinstance(val, dict)
+                and isinstance(val.get("job_id"), str)):
+            clean[key] = {"job_id": val["job_id"],
+                          "lease_expires_at": val.get("lease_expires_at")}
+    return clean
+
+
+def _load_wal(path):
+    _truncate_torn_tail(path)
+    jobs = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                if obj.get("op") == "upsert":
+                    job = obj["job"]
+                    jobs[job["id"]] = job
+                elif obj.get("op") == "upsert_batch":
+                    for job in obj["jobs"]:
+                        jobs[job["id"]] = job
+                # idem ops are replayed by _load_wal_idem
+    except FileNotFoundError:
+        pass
+    return jobs
+
+
+def _load_wal_idem(path):
+    _truncate_torn_tail(path)
+    idem = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                if obj.get("op") == "idem":
+                    idem[obj["key"]] = {
+                        "job_id": obj["job_id"],
+                        "lease_expires_at": obj.get("lease_expires_at")}
+                elif obj.get("op") == "idem_del":
+                    idem.pop(obj["key"], None)
+    except FileNotFoundError:
+        pass
+    return idem
+
+
+def _load_sched_snapshot(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+    scheds = obj.get("schedules") if isinstance(obj, dict) else None
+    if not isinstance(scheds, dict):
+        return {}
+    clean = {}
+    for key, val in scheds.items():
+        if isinstance(val, dict) and val.get("id") == key:
+            clean[key] = val
+    return clean
+
+
+def _load_wal_sched(path):
+    _truncate_torn_tail(path)
+    scheds = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                if obj.get("op") == "sched":
+                    s = obj["sched"]
+                    scheds[s["id"]] = s
+                elif obj.get("op") == "sched_del":
+                    scheds.pop(obj["id"], None)
+    except FileNotFoundError:
+        pass
+    return scheds
+
+
+def load_sched(dirpath):
+    scheds = _load_sched_snapshot(os.path.join(dirpath, "snapshot.json"))
+    scheds.update(_load_wal_sched(os.path.join(dirpath, "wal.log")))
+    return scheds
+
+
+def load_state(dirpath):
+    jobs = _load_snapshot(os.path.join(dirpath, "snapshot.json"))
+    jobs.update(_load_wal(os.path.join(dirpath, "wal.log")))
+    return jobs
+
+
+def load_idem(dirpath):
+    idem = _load_idem_snapshot(os.path.join(dirpath, "snapshot.json"))
+    idem.update(_load_wal_idem(os.path.join(dirpath, "wal.log")))
+    return idem
+
+
+def _meta_from_dict(raw):
+    if not isinstance(raw, dict):
+        return {"paused": False, "draining": False}
+    return {"paused": bool(raw.get("paused", False)),
+            "draining": bool(raw.get("draining", False))}
+
+
+def _load_meta_snapshot(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+    except (FileNotFoundError, ValueError, OSError):
+        return {"paused": False, "draining": False}
+    meta = obj.get("meta") if isinstance(obj, dict) else None
+    return _meta_from_dict(meta)
+
+
+def _load_wal_meta(path):
+    _truncate_torn_tail(path)
+    meta = None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                if obj.get("op") == "meta" and isinstance(obj.get("meta"), dict):
+                    meta = _meta_from_dict(obj["meta"])
+    except FileNotFoundError:
+        pass
+    return meta
+
+
+def load_meta(dirpath):
+    return {"paused": False, "draining": False}  # BUG: pause never loaded from disk
+
+
+def append_ops(dirpath, ops):
+    ops = list(ops)
+    if not ops:
+        return
+    path = os.path.join(dirpath, "wal.log")
+    with open(path, "a", encoding="utf-8") as f:
+        for op in ops:
+            f.write(json.dumps(op, separators=(",", ":")) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    _fsync_dir(dirpath)
+
+
+def write_snapshot(dirpath, jobs, idem, schedules, meta=None):
+    if meta is None:
+        meta = {"paused": False, "draining": False}
+    path = os.path.join(dirpath, "snapshot.json")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"jobs": jobs, "idem": idem, "schedules": schedules,
+                   "meta": {"paused": bool(meta.get("paused", False)),
+                            "draining": bool(meta.get("draining", False))}},
+                  f, separators=(",", ":"))
+        f.flush()
+        os.fsync(f.fileno())
+    os.rename(tmp, path)
+    _fsync_dir(dirpath)
+
+
+def truncate_wal(dirpath):
+    path = os.path.join(dirpath, "wal.log")
+    with open(path, "w", encoding="utf-8") as f:
+        f.flush()
+        os.fsync(f.fileno())
+    _fsync_dir(dirpath)
+
+
+# ------------------------------------------------------------------ logic ---
+
+def sweep_expired(jobs, t):
+    """Return claimed jobs whose lease expired back to pending. Ids changed.
+
+    Jobs past their TTL are left alone here; the TTL sweep (pre-step 3)
+    marks them dead instead of requeueing them.
+    """
+    changed = []
+    for job in jobs.values():
+        if (job["status"] == "claimed"
+                and job.get("lease_expires_at") is not None
+                and job["lease_expires_at"] <= t):
+            ttl = job.get("ttl")
+            if ttl is not None and t - job["created_at"] > ttl:
+                continue
+            job["status"] = "pending"
+            job["claimed_at"] = None
+            job["lease_expires_at"] = None
+            changed.append(job["id"])
+    return changed
+
+
+def sweep_ttl(jobs, t):
+    """Expire jobs past their TTL. Returns ids changed.
+
+    Pending jobs past TTL become dead. Claimed jobs are exempt while their
+    lease is valid; with an expired lease they go dead (not back to pending).
+    """
+    changed = []
+    for job in jobs.values():
+        ttl = job.get("ttl")
+        if ttl is None:
+            continue
+        if t - job["created_at"] <= ttl:
+            continue
+        if job["status"] == "pending":
+            job["status"] = "dead"
+            job["last_error"] = "expired"
+            changed.append(job["id"])
+        elif job["status"] == "claimed":
+            lease = job.get("lease_expires_at")
+            if lease is not None and lease > t:
+                continue
+            job["status"] = "dead"
+            job["claimed_at"] = None
+            job["lease_expires_at"] = None
+            job["last_error"] = "expired"
+            changed.append(job["id"])
+    return changed
+
+
+def sweep_dep_failures(jobs):
+    """Cascade: pending jobs with any dead dependency become dead.
+
+    Repeats until fixpoint. Returns ids changed. last_error is exactly
+    'dependency failed'.
+    """
+    changed = []
+    progressed = True
+    while progressed:
+        progressed = False
+        for job in jobs.values():
+            if job["status"] != "pending":
+                continue
+            deps = job.get("depends_on") or []
+            if not deps:
+                continue
+            if any(jobs.get(d, {}).get("status") == "dead" for d in deps):
+                job["status"] = "dead"
+                job["last_error"] = "dependency failed"
+                changed.append(job["id"])
+                progressed = True
+    return changed
+
+
+def _deps_satisfied(jobs, job, t):
+    """True if job is claimable w.r.t. depends_on (all deps done)."""
+    for dep_id in job.get("depends_on") or []:
+        dep = jobs.get(dep_id)
+        if dep is None or dep.get("status") != "done":
+            return False
+    return True
+
+
+def _parse_depends_on_cli(text):
+    """Parse --depends-on ID[,ID...]. Empty tokens -> exit 2."""
+    if text is None:
+        return []
+    parts = text.split(",")
+    if any(p.strip() == "" for p in parts) or text.strip() == "":
+        die("empty depends_on token", 2)
+    return [p.strip() for p in parts]
+
+
+def _validate_depends_on(jid, deps, jobs, extra_edges=None):
+    """Validate depends_on list against known jobs (+ optional extra edges).
+
+    extra_edges: dict id -> list of dep ids for jobs not yet in `jobs`
+    (used by batch validation). Dies exit 2 on unknown / self / cycle /
+    empty token.
+    """
+    if not isinstance(deps, list):
+        die("depends_on must be a list of job ids", 2)
+    for d in deps:
+        if not isinstance(d, str) or d == "":
+            die("empty depends_on token", 2)
+        if d == jid:
+            die("self-dependency: %s" % jid, 2)
+        known = d in jobs or (extra_edges is not None and d in extra_edges)
+        if not known:
+            die("unknown dependency id: %s" % d, 2)
+    # Cycle check on the graph of depends_on edges (A -> B means A waits on B).
+    graph = {}
+    for existing in jobs.values():
+        graph[existing["id"]] = list(existing.get("depends_on") or [])
+    if extra_edges is not None:
+        for eid, edeps in extra_edges.items():
+            graph[eid] = list(edeps)
+    if jid is not None:
+        graph[jid] = list(deps)
+
+    def _has_cycle():
+        WHITE, GRAY, BLACK = 0, 1, 2
+        color = {n: WHITE for n in graph}
+
+        def dfs(n):
+            color[n] = GRAY
+            for m in graph.get(n, []):
+                if m not in color:
+                    continue
+                if color[m] == GRAY:
+                    return True
+                if color[m] == WHITE and dfs(m):
+                    return True
+            color[n] = BLACK
+            return False
+
+        return any(color[n] == WHITE and dfs(n) for n in graph)
+
+    if _has_cycle():
+        die("cycle in depends_on graph", 2)
+
+
+def _transitive_pending_dependents(jobs, root_id):
+    """Pending jobs that transitively depend on root_id (not including root)."""
+    rev = {}
+    for job in jobs.values():
+        for d in job.get("depends_on") or []:
+            rev.setdefault(d, []).append(job["id"])
+    out = []
+    stack = list(rev.get(root_id, []))
+    seen = set()
+    while stack:
+        nid = stack.pop()
+        if nid in seen:
+            continue
+        seen.add(nid)
+        job = jobs.get(nid)
+        if job is None:
+            continue
+        if job["status"] == "pending":
+            out.append(nid)
+        for child in rev.get(nid, []):
+            if child not in seen:
+                stack.append(child)
+    return out
+
+
+def _parse_cron_field(text, lo, hi, name):
+    """Parse one cron field. Returns (set_of_values, is_star). Dies 2."""
+    if text == "*":
+        return set(range(lo, hi + 1)), True
+    values = set()
+    for part in text.split(","):
+        if not part:
+            die("invalid cron: empty part in %s field" % name, 2)
+        if "/" in part:
+            base, step_s = part.split("/", 1)
+            if base != "*" and "-" not in base:
+                die("invalid cron: bad step base in %s field" % name, 2)
+            try:
+                step = int(step_s)
+            except ValueError:
+                die("invalid cron: bad step in %s field" % name, 2)
+            if step < 1:
+                die("invalid cron: step must be >= 1 in %s field" % name, 2)
+        else:
+            base, step = part, 1
+        if base == "*":
+            start, end = lo, hi
+        elif "-" in base:
+            a_s, b_s = base.split("-", 1)
+            try:
+                start, end = int(a_s), int(b_s)
+            except ValueError:
+                die("invalid cron: bad range in %s field" % name, 2)
+        else:
+            try:
+                start = end = int(base)
+            except ValueError:
+                die("invalid cron: bad value in %s field" % name, 2)
+        if not (lo <= start <= hi and lo <= end <= hi and start <= end):
+            die("invalid cron: out-of-range value in %s field" % name, 2)
+        for v in range(start, end + 1, step):
+            values.add(v)
+    if not values:
+        die("invalid cron: empty %s field" % name, 2)
+    return values, False
+
+
+def _parse_cron(expr):
+    """Parse a 5-field cron expression. Returns field tuple. Dies 2."""
+    parts = expr.split()
+    if len(parts) != 5:
+        die("invalid cron: expected 5 fields, got %d" % len(parts), 2)
+    minute, _ = _parse_cron_field(parts[0], 0, 59, "minute")
+    hour, _ = _parse_cron_field(parts[1], 0, 23, "hour")
+    dom, dom_star = _parse_cron_field(parts[2], 1, 31, "dom")
+    month, _ = _parse_cron_field(parts[3], 1, 12, "month")
+    dow, dow_star = _parse_cron_field(parts[4], 0, 7, "dow")
+    if 7 in dow:  # 0 and 7 both mean Sunday
+        dow.discard(7)
+        dow.add(0)
+    return (minute, hour, dom, month, dow, dom_star, dow_star)
+
+
+def _utc_dt(epoch):
+    return datetime.datetime.fromtimestamp(epoch, tz=datetime.timezone.utc)
+
+
+def _cron_match(fields, dt):
+    minute, hour, dom, month, dow, dom_star, dow_star = fields
+    if dt.minute not in minute:
+        return False
+    if dt.hour not in hour:
+        return False
+    if dt.month not in month:
+        return False
+    dow_num = (dt.weekday() + 1) % 7  # Monday=0 -> Sunday=0
+    dom_ok = dt.day in dom
+    dow_ok = dow_num in dow
+    if dom_star and dow_star:
+        return True
+    if dom_star:
+        return dow_ok
+    if dow_star:
+        return dom_ok
+    return dom_ok or dow_ok
+
+
+def _materialize(schedules, jobs, t):
+    """Create jobs for due schedule occurrences.
+
+    Cron fields are matched against the local wall-clock in the schedule's
+    timezone. DST gaps (spring-forward) never produce a wall clock, so they
+    are skipped automatically; a fall-back overlap produces the same wall
+    clock twice and only the first occurrence is kept (seen_wall), so
+    exactly one job is materialized.
+
+    Returns (new_jobs, changed_schedule_ids). Idempotent: job ids are
+    deterministic ({sid}-{local YYYYMMDDHHMM}), and last_materialized
+    advances atomically with the created jobs (persisted in the same WAL
+    append by the caller).
+    """
+    new_jobs = []
+    changed = set()
+    now_min = int(t // 60) * 60
+    for sid, sched in schedules.items():
+        fields = _parse_cron(sched["cron"])
+        tz = _get_zone(sched.get("tz", "UTC"))
+        if sched["last_materialized"] is None:
+            start_min = int(sched["created_at"] // 60) * 60
+            minutes = [m for m in range(start_min, now_min + 1, 60)
+                       if m >= sched["created_at"]]
+        else:
+            start_min = int(sched["last_materialized"]) + 60
+            minutes = list(range(start_min, now_min + 1, 60))
+        occs = []  # (utc_minute, local_dt)
+        seen_wall = set()
+        for m in minutes:
+            local = _utc_dt(m).astimezone(tz)
+            if not _cron_match(fields, local):
+                continue
+            wall = (local.year, local.month, local.day,
+                    local.hour, local.minute)
+            if wall in seen_wall:
+                continue  # fall-back overlap: keep the first occurrence only
+            seen_wall.add(wall)
+            occs.append((m, local))
+        end_at = sched.get("end_at")
+        if end_at is not None:
+            occs = [(m, local) for (m, local) in occs if m < end_at]
+        if not occs:
+            continue
+        for m, local in occs:
+            jid = "%s-%04d%02d%02d%02d%02d" % (
+                sid, local.year, local.month, local.day,
+                local.hour, local.minute)
+            if jid in jobs:
+                continue  # already materialized (crash retry); no duplicate
+            job = {
+                "id": jid,
+                "payload": sched["payload"],
+                "priority": sched["priority"],
+                "max_attempts": sched["max_attempts"],
+                "attempts": 0,
+                "status": "pending",
+                "created_at": t,
+                "run_at": float(m),
+                "dedupe_key": None,
+                "ttl": None,
+                "fence": 0,
+                "depends_on": [],
+                "tag": None,
+                "claimed_at": None,
+                "lease_expires_at": None,
+                "last_error": None,
+                "result": None,
+            }
+            jobs[jid] = job
+            new_jobs.append(job)
+        sched["last_materialized"] = float(max(m for m, _ in occs))
+        changed.add(sid)
+    return new_jobs, changed
+
+
+def sweep_idem(idem, t):
+    """Discard idempotency mappings whose lease has expired. Keys discarded."""
+    discarded = []
+    for key in list(idem.keys()):
+        entry = idem[key]
+        if (entry.get("lease_expires_at") is not None
+                and entry["lease_expires_at"] <= t):
+            del idem[key]
+            discarded.append(key)
+    return discarded
+
+
+def _discard_idem_for_job(ctx, jid):
+    idem = ctx["idem"]
+    for key in [k for k, e in idem.items() if e["job_id"] == jid]:
+        del idem[key]
+        ctx["idem_ops"].append((key, None))
+
+
+def _new_id(jobs):
+    while True:
+        jid = secrets.token_hex(8)
+        if jid not in jobs:
+            return jid
+
+
+def _find_dedupe(jobs, key):
+    for job in jobs.values():
+        if job.get("dedupe_key") == key and job["status"] in ("pending", "claimed"):
+            return job
+    return None
+
+
+def _get_job_or_die(jobs, jid):
+    job = jobs.get(jid)
+    if job is None:
+        die("job not found: %s" % jid, 4)
+    return job
+
+
+def summarize(job):
+    return {"id": job["id"], "status": job["status"],
+            "priority": job["priority"], "attempts": job["attempts"],
+            "created_at": job["created_at"], "run_at": job["run_at"]}
+
+
+def _check_id_format(jid):
+    if not ID_RE.match(jid):
+        die("invalid id: must match ^[A-Za-z0-9_-]{1,64}$", 2)
+
+
+def _check_tag_format(tag):
+    if not isinstance(tag, str) or not TAG_RE.match(tag):
+        die("invalid tag: must match ^[A-Za-z0-9_-]{1,32}$", 2)
+
+
+def _require_not_draining(ctx):
+    if ctx["meta"].get("draining"):
+        die("draining", 3)
+
+
+def cmd_enqueue(args, jobs, t, dirty, ctx):
+    _require_not_draining(ctx)
+    try:
+        payload = json.loads(args.payload)
+    except ValueError:
+        die("invalid payload: not valid JSON", 2)
+    if args.id is not None:
+        _check_id_format(args.id)
+        if args.id in jobs:
+            die("duplicate id: %s" % args.id, 2)
+        jid = args.id
+    else:
+        jid = _new_id(jobs)
+    if args.delay < 0:
+        die("delay must be >= 0", 2)
+    if args.max_attempts < 1:
+        die("max_attempts must be >= 1", 2)
+    if args.ttl is not None and args.ttl <= 0:
+        die("ttl must be > 0", 2)
+    tag = getattr(args, "tag", None)
+    if tag is not None:
+        _check_tag_format(tag)
+    deps = _parse_depends_on_cli(getattr(args, "depends_on", None))
+    _validate_depends_on(jid, deps, jobs)
+    if args.dedupe_key is not None:
+        hit = _find_dedupe(jobs, args.dedupe_key)
+        if hit is not None:
+            sys.stdout.write(hit["id"] + "\n")
+            return 0
+    job = {
+        "id": jid,
+        "payload": payload,
+        "priority": args.priority,
+        "max_attempts": args.max_attempts,
+        "attempts": 0,
+        "status": "pending",
+        "created_at": t,
+        "run_at": t + args.delay,
+        "dedupe_key": args.dedupe_key,
+        "ttl": args.ttl,
+        "fence": 0,
+        "depends_on": deps,
+        "tag": tag,
+        "claimed_at": None,
+        "lease_expires_at": None,
+        "last_error": None,
+        "result": None,
+    }
+    jobs[jid] = job
+    dirty.add(jid)
+    sys.stdout.write(jid + "\n")
+    return 0
+
+
+def _validate_batch_element(el, i, jobs, seen_ids):
+    if not isinstance(el, dict):
+        die("invalid jobs: element %d is not an object" % i, 2)
+    if "payload" not in el:
+        die("invalid jobs: element %d is missing payload" % i, 2)
+    priority = el.get("priority", 0)
+    if isinstance(priority, bool) or not isinstance(priority, int):
+        die("invalid jobs: element %d has bad priority" % i, 2)
+    delay = el.get("delay", 0)
+    if isinstance(delay, bool) or not isinstance(delay, (int, float)):
+        die("invalid jobs: element %d has bad delay" % i, 2)
+    if delay < 0:
+        die("invalid jobs: element %d has negative delay" % i, 2)
+    max_attempts = el.get("max_attempts", 3)
+    if (isinstance(max_attempts, bool)
+            or not isinstance(max_attempts, int) or max_attempts < 1):
+        die("invalid jobs: element %d has bad max_attempts" % i, 2)
+    jid = el.get("id")
+    if jid is not None:
+        if not isinstance(jid, str) or not ID_RE.match(jid):
+            die("invalid jobs: element %d has bad id" % i, 2)
+        if jid in jobs or jid in seen_ids:
+            die("invalid jobs: element %d has duplicate id" % i, 2)
+        seen_ids.add(jid)
+    dedupe_key = el.get("dedupe_key")
+    if dedupe_key is not None and not isinstance(dedupe_key, str):
+        die("invalid jobs: element %d has bad dedupe_key" % i, 2)
+    depends_on = el.get("depends_on", [])
+    if depends_on is None:
+        depends_on = []
+    if not isinstance(depends_on, list):
+        die("invalid jobs: element %d has bad depends_on" % i, 2)
+    for d in depends_on:
+        if not isinstance(d, str) or d == "":
+            die("empty depends_on token", 2)
+    tag = el.get("tag", None)
+    if tag is not None:
+        if not isinstance(tag, str) or not TAG_RE.match(tag):
+            die("invalid jobs: element %d has bad tag" % i, 2)
+    return {"payload": el["payload"], "priority": priority, "delay": delay,
+            "max_attempts": max_attempts, "id": jid,
+            "dedupe_key": dedupe_key, "depends_on": depends_on, "tag": tag}
+
+
+def cmd_enqueue_batch(args, jobs, t, dirty, ctx):
+    _require_not_draining(ctx)
+    try:
+        items = json.loads(args.jobs)
+    except ValueError:
+        die("invalid jobs: not a JSON array", 2)
+    if not isinstance(items, list):
+        die("invalid jobs: not a JSON array", 2)
+    # Pass 1: validate EVERY element before creating anything.
+    seen_ids = set()
+    specs = [_validate_batch_element(el, i, jobs, seen_ids)
+             for i, el in enumerate(items)]
+    # Pass 1b: resolve ids (including dedupe) and depends_on; validate
+    # cycles for the batch-as-a-whole BEFORE creating anything.
+    sim_jobs = dict(jobs)
+    resolved_ids = []
+    will_create = []
+    # Map a user-declared earlier-element id -> its resolved job id
+    # (identity when created; the hit's id when deduped).
+    declared_to_resolved = {}
+    for spec in specs:
+        if spec["dedupe_key"] is not None:
+            hit = _find_dedupe(sim_jobs, spec["dedupe_key"])
+            if hit is not None:
+                resolved_ids.append(hit["id"])
+                will_create.append(False)
+                if spec["id"] is not None:
+                    declared_to_resolved[spec["id"]] = hit["id"]
+                continue
+        jid = spec["id"] if spec["id"] is not None else _new_id(sim_jobs)
+        sim_jobs[jid] = {
+            "id": jid, "status": "pending", "dedupe_key": spec["dedupe_key"],
+            "depends_on": [],
+        }
+        resolved_ids.append(jid)
+        will_create.append(True)
+        if spec["id"] is not None:
+            declared_to_resolved[spec["id"]] = jid
+
+    resolved_deps = []
+    extra_edges = {}
+    # All new batch ids are visible for depends_on resolution so the
+    # batch-as-a-whole can be cycle-checked before creating anything.
+    # (Forward refs within the batch are allowed; unknown outside the
+    # batch still fails.)
+    for i, spec in enumerate(specs):
+        if will_create[i]:
+            extra_edges[resolved_ids[i]] = []  # placeholder ids
+    for i, spec in enumerate(specs):
+        # Remap depends_on tokens that name batch elements to resolved ids.
+        deps = [declared_to_resolved.get(d, d) for d in spec["depends_on"]]
+        resolved_deps.append(deps)
+        if not will_create[i]:
+            continue
+        jid = resolved_ids[i]
+        extra_edges[jid] = deps
+    # Validate each new job's deps and the whole-batch graph once.
+    if extra_edges:
+        for jid, deps in list(extra_edges.items()):
+            _validate_depends_on(jid, deps, jobs, extra_edges=extra_edges)
+
+    # Pass 2: create in order.
+    ids = []
+    new_jobs = []
+    for i, spec in enumerate(specs):
+        if not will_create[i]:
+            ids.append(resolved_ids[i])
+            continue
+        jid = resolved_ids[i]
+        job = {
+            "id": jid,
+            "payload": spec["payload"],
+            "priority": spec["priority"],
+            "max_attempts": spec["max_attempts"],
+            "attempts": 0,
+            "status": "pending",
+            "created_at": t,
+            "run_at": t + spec["delay"],
+            "dedupe_key": spec["dedupe_key"],
+            "ttl": None,
+            "fence": 0,
+            "depends_on": list(resolved_deps[i]),
+            "tag": spec["tag"],
+            "claimed_at": None,
+            "lease_expires_at": None,
+            "last_error": None,
+            "result": None,
+        }
+        jobs[jid] = job
+        new_jobs.append(job)
+        ids.append(jid)
+    # The whole batch is persisted as ONE WAL record: a kill mid-batch can
+    # only leave the complete batch or a torn tail (discarded) behind.
+    if new_jobs:
+        ctx["batch"] = new_jobs
+    sys.stdout.write(json.dumps(ids) + "\n")
+    return 0
+
+
+def cmd_list(args, jobs, t, dirty, ctx):
+    rows = [summarize(j) for j in jobs.values()]
+    if args.status is not None:
+        rows = [r for r in rows if r["status"] == args.status]
+    rows.sort(key=lambda r: (r["created_at"], r["id"]))
+    sys.stdout.write(json.dumps(rows) + "\n")
+    return 0
+
+
+def cmd_show(args, jobs, t, dirty, ctx):
+    job = _get_job_or_die(jobs, args.id)
+    if "tag" not in job:
+        job["tag"] = None
+    sys.stdout.write(json.dumps(job) + "\n")
+    return 0
+
+
+def cmd_claim(args, jobs, t, dirty, ctx):
+    if args.lease <= 0:
+        die("lease must be > 0", 2)
+    count = 1 if args.count is None else args.count
+    if count < 1:
+        die("--count must be >= 1", 2)
+    key = args.idempotency_key
+    if key is not None:
+        _check_id_format(key)
+        if count > 1:
+            die("--idempotency-key cannot be combined with --count > 1", 2)
+    tag = getattr(args, "tag", None)
+    if tag is not None:
+        _check_tag_format(tag)
+    idem = ctx["idem"]
+    # CRITICAL: while paused, an idempotency-key retry of an in-flight
+    # (claimed, unexpired) job still returns that job. New claims do not.
+    if key is not None:
+        entry = idem.get(key)
+        if entry is not None:
+            job = jobs.get(entry["job_id"])
+            if (job is not None and job["status"] == "claimed"
+                    and job.get("lease_expires_at") is not None
+                    and job["lease_expires_at"] > t):
+                # Same claim served again: same job, same fence, no bump,
+                # lease NOT extended. Works even while paused.
+                if "tag" not in job:
+                    job["tag"] = None
+                sys.stdout.write(json.dumps(job) + "\n")
+                return 0
+        # stale or missing mapping: fall through (pause may then reject)
+    # Pause wins over drain for claim: if paused, reject new claims.
+    if ctx["meta"].get("paused"):
+        die("queue paused", 1)
+    # Candidates: pending, run_at<=now, deps done, AND tag filter.
+    # Without --tag: ONLY jobs whose tag is null. With --tag TAG: ONLY
+    # jobs whose tag equals TAG. Unmet deps are skipped so --count can
+    # fill from ready lower-priority jobs.
+    cands = [j for j in jobs.values()
+             if (j["status"] == "pending" and j["run_at"] <= t
+                 and _deps_satisfied(jobs, j, t)
+                 and ((tag is None and j.get("tag") is None)
+                      or (tag is not None and j.get("tag") == tag)))]
+    cands.sort(key=lambda j: (-j["priority"], j["created_at"], j["id"]))
+    if not cands:
+        die("no jobs available", 1)
+    picked = cands[:count]
+    for job in picked:
+        job["status"] = "claimed"
+        job["claimed_at"] = t
+        job["lease_expires_at"] = t + args.lease
+        job["fence"] = job.get("fence", 0) + 1
+        if "tag" not in job:
+            job["tag"] = None
+        dirty.add(job["id"])
+    if key is not None:
+        job = picked[0]
+        entry = {"job_id": job["id"],
+                 "lease_expires_at": t + args.lease}
+        idem[key] = entry
+        ctx["idem_ops"].append((key, entry))
+    if args.count is None:
+        sys.stdout.write(json.dumps(picked[0]) + "\n")
+    else:
+        sys.stdout.write(json.dumps(picked) + "\n")
+    return 0
+
+
+def cmd_pause(args, jobs, t, dirty, ctx):
+    if not ctx["meta"].get("paused"):
+        ctx["meta"]["paused"] = True
+        ctx["meta_dirty"] = True
+    sys.stdout.write("paused\n")
+    return 0
+
+
+def cmd_drain(args, jobs, t, dirty, ctx):
+    if not ctx["meta"].get("draining"):
+        ctx["meta"]["draining"] = True
+        ctx["meta_dirty"] = True
+    sys.stdout.write("draining\n")
+    return 0
+
+
+def cmd_resume(args, jobs, t, dirty, ctx):
+    # Clears BOTH paused and draining.
+    if ctx["meta"].get("paused") or ctx["meta"].get("draining"):
+        ctx["meta"]["paused"] = False
+        ctx["meta"]["draining"] = False
+        ctx["meta_dirty"] = True
+    else:
+        ctx["meta"]["paused"] = False
+        ctx["meta"]["draining"] = False
+    sys.stdout.write("resumed\n")
+    return 0
+
+
+def cmd_cancel(args, jobs, t, dirty, ctx):
+    job = _get_job_or_die(jobs, args.id)
+    if job["status"] != "pending":
+        die("not pending", 3)
+    cascade = bool(getattr(args, "cascade", False))
+    to_cancel = [args.id]
+    if cascade:
+        to_cancel.extend(_transitive_pending_dependents(jobs, args.id))
+    cancelled = []
+    for jid in to_cancel:
+        j = jobs[jid]
+        if j["status"] != "pending":
+            continue
+        j["status"] = "dead"
+        j["last_error"] = "cancelled"
+        dirty.add(jid)
+        _discard_idem_for_job(ctx, jid)
+        cancelled.append(jid)
+    cancelled.sort()
+    if cascade:
+        sys.stdout.write(json.dumps(cancelled) + "\n")
+    else:
+        sys.stdout.write(args.id + "\n")
+    return 0
+
+
+def cmd_complete(args, jobs, t, dirty, ctx):
+    fence = _require_fence(args)
+    job = _get_job_or_die(jobs, args.id)
+    if job["status"] != "claimed":
+        die("job not claimed", 3)  # REQ-CLAIMED-COMPLETE
+    if job.get("fence", 0) != fence:
+        die("stale fence", 3)
+    result = None
+    if args.result is not None:
+        try:
+            result = json.loads(args.result)
+        except ValueError:
+            die("invalid result: not valid JSON", 2)
+    job["status"] = "done"
+    job["result"] = result
+    dirty.add(job["id"])
+    _discard_idem_for_job(ctx, job["id"])
+    sys.stdout.write(job["id"] + "\n")
+    return 0
+
+
+def cmd_fail(args, jobs, t, dirty, ctx):
+    fence = _require_fence(args)
+    job = _get_job_or_die(jobs, args.id)
+    if job["status"] != "claimed":
+        die("job not claimed", 3)  # REQ-CLAIMED-FAIL
+    if job.get("fence", 0) != fence:
+        die("stale fence", 3)
+    job["attempts"] += 1
+    if job["attempts"] >= job["max_attempts"]:
+        job["status"] = "dead"
+    else:
+        job["status"] = "pending"
+        job["run_at"] = t + 10 * 2 ** (job["attempts"] - 1)
+    job["claimed_at"] = None
+    job["lease_expires_at"] = None
+    job["last_error"] = args.error
+    dirty.add(job["id"])
+    if job["status"] == "dead":
+        _discard_idem_for_job(ctx, job["id"])
+    sys.stdout.write(job["id"] + "\n")
+    return 0
+
+
+def cmd_stats(args, jobs, t, dirty, ctx):
+    counts = {"pending": 0, "claimed": 0, "done": 0, "dead": 0}
+    for job in jobs.values():
+        if job["status"] in counts:
+            counts[job["status"]] += 1
+    counts["total"] = sum(counts.values())
+    sys.stdout.write(json.dumps(counts) + "\n")
+    return 0
+
+
+def cmd_compact(args, jobs, t, dirty, ctx):
+    ctx["compact"] = True
+    sys.stdout.write("ok\n")
+    return 0
+
+
+def _new_sched_id(schedules, jobs):
+    while True:
+        sid = secrets.token_hex(8)
+        if sid not in schedules and sid not in jobs:
+            return sid
+
+
+def cmd_schedule(args, jobs, t, dirty, ctx):
+    _require_not_draining(ctx)
+    try:
+        payload = json.loads(args.payload)
+    except ValueError:
+        die("invalid payload: not valid JSON", 2)
+    if args.id is not None:
+        _check_id_format(args.id)
+        if args.id in ctx["schedules"]:
+            die("duplicate schedule id: %s" % args.id, 2)
+        sid = args.id
+    else:
+        sid = _new_sched_id(ctx["schedules"], jobs)
+    if args.max_attempts < 1:
+        die("max_attempts must be >= 1", 2)
+    _parse_cron(args.cron)  # validates; dies 2 on malformed input
+    _get_zone(args.tz)  # validates; dies 2 on unknown timezone
+    sched = {
+        "id": sid,
+        "payload": payload,
+        "cron": args.cron,
+        "tz": args.tz,
+        "priority": args.priority,
+        "max_attempts": args.max_attempts,
+        "end_at": args.end_at,
+        "last_materialized": None,
+        "created_at": t,
+    }
+    ctx["schedules"][sid] = sched
+    ctx["dirty_sched"].add(sid)
+    sys.stdout.write(sid + "\n")
+    return 0
+
+
+def cmd_schedules(args, jobs, t, dirty, ctx):
+    rows = [{"id": s["id"], "cron": s["cron"], "tz": s.get("tz", "UTC"),
+             "priority": s["priority"],
+             "max_attempts": s["max_attempts"], "end_at": s["end_at"],
+             "last_materialized": s["last_materialized"],
+             "created_at": s["created_at"]}
+            for s in ctx["schedules"].values()]
+    rows.sort(key=lambda r: (r["created_at"], r["id"]))
+    sys.stdout.write(json.dumps(rows) + "\n")
+    return 0
+
+
+def cmd_unschedule(args, jobs, t, dirty, ctx):
+    schedules = ctx["schedules"]
+    if args.id not in schedules:
+        die("schedule not found: %s" % args.id, 4)
+    del schedules[args.id]
+    ctx["dirty_sched"].discard(args.id)
+    ctx["sched_dels"].add(args.id)
+    sys.stdout.write(args.id + "\n")
+    return 0
+
+
+def cmd_extend_lease(args, jobs, t, dirty, ctx):
+    fence = _require_fence(args)
+    job = _get_job_or_die(jobs, args.id)
+    if job["status"] != "claimed":
+        die("job not claimed", 3)
+    if job.get("fence", 0) != fence:
+        die("stale fence", 3)
+    if args.lease <= 0:
+        die("lease must be > 0", 2)
+    job["lease_expires_at"] = t + args.lease
+    dirty.add(job["id"])
+    # Keep any idempotency mapping coherent with the new lease so a retry
+    # with the same key still returns this job instead of claiming anew.
+    # The fence is NOT changed by extend-lease.
+    for key, entry in ctx["idem"].items():
+        if entry["job_id"] == job["id"]:
+            entry["lease_expires_at"] = t + args.lease
+            ctx["idem_ops"].append((key, dict(entry)))
+    sys.stdout.write(job["id"] + "\n")
+    return 0
+
+
+COMMANDS = {
+    "enqueue": cmd_enqueue,
+    "enqueue-batch": cmd_enqueue_batch,
+    "list": cmd_list,
+    "show": cmd_show,
+    "claim": cmd_claim,
+    "complete": cmd_complete,
+    "fail": cmd_fail,
+    "stats": cmd_stats,
+    "schedule": cmd_schedule,
+    "schedules": cmd_schedules,
+    "unschedule": cmd_unschedule,
+    "extend-lease": cmd_extend_lease,
+    "compact": cmd_compact,
+    "pause": cmd_pause,
+    "drain": cmd_drain,
+    "resume": cmd_resume,
+    "cancel": cmd_cancel,
+}
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(prog="q", allow_abbrev=False)
+    sub = p.add_subparsers(dest="cmd")
+    e = sub.add_parser("enqueue", allow_abbrev=False)
+    e.add_argument("--payload", required=True)
+    e.add_argument("--priority", type=int, default=0)
+    e.add_argument("--delay", type=float, default=0.0)
+    e.add_argument("--id", default=None)
+    e.add_argument("--dedupe-key", default=None)
+    e.add_argument("--max-attempts", type=int, default=3)
+    e.add_argument("--ttl", type=float, default=None)
+    e.add_argument("--depends-on", dest="depends_on", default=None)
+    e.add_argument("--tag", default=None)
+    b = sub.add_parser("enqueue-batch", allow_abbrev=False)
+    b.add_argument("--jobs", required=True)
+    li = sub.add_parser("list", allow_abbrev=False)
+    li.add_argument("--status", choices=list(STATUSES), default=None)
+    sh = sub.add_parser("show", allow_abbrev=False)
+    sh.add_argument("id")
+    cl = sub.add_parser("claim", allow_abbrev=False)
+    cl.add_argument("--lease", type=float, default=60.0)
+    cl.add_argument("--idempotency-key", default=None)
+    cl.add_argument("--count", type=int, default=None)
+    cl.add_argument("--tag", default=None)
+    co = sub.add_parser("complete", allow_abbrev=False)
+    co.add_argument("id")
+    co.add_argument("--fence", type=int, default=None)
+    co.add_argument("--result", default=None)
+    fa = sub.add_parser("fail", allow_abbrev=False)
+    fa.add_argument("id")
+    fa.add_argument("--fence", type=int, default=None)
+    fa.add_argument("--error", default=None)
+    sub.add_parser("stats", allow_abbrev=False)
+    s = sub.add_parser("schedule", allow_abbrev=False)
+    s.add_argument("--payload", required=True)
+    s.add_argument("--cron", required=True)
+    s.add_argument("--id", default=None)
+    s.add_argument("--priority", type=int, default=0)
+    s.add_argument("--max-attempts", type=int, default=3)
+    s.add_argument("--end-at", type=float, default=None)
+    s.add_argument("--tz", default="UTC")
+    sub.add_parser("schedules", allow_abbrev=False)
+    u = sub.add_parser("unschedule", allow_abbrev=False)
+    u.add_argument("id")
+    x = sub.add_parser("extend-lease", allow_abbrev=False)
+    x.add_argument("id")
+    x.add_argument("--fence", type=int, default=None)
+    x.add_argument("--lease", type=float, required=True)
+    sub.add_parser("compact", allow_abbrev=False)
+    sub.add_parser("pause", allow_abbrev=False)
+    sub.add_parser("drain", allow_abbrev=False)
+    sub.add_parser("resume", allow_abbrev=False)
+    ca = sub.add_parser("cancel", allow_abbrev=False)
+    ca.add_argument("id")
+    ca.add_argument("--cascade", action="store_true", default=False)
+    args = p.parse_args(argv)
+    if args.cmd is None:
+        p.error("unknown command")
+    return args
+
+
+def main(argv):
+    args = parse_args(argv)
+    dirpath = data_dir()
+    lockfh = _acquire_lock(dirpath)
+    try:
+        t = utcnow()
+        jobs = load_state(dirpath)
+        idem = load_idem(dirpath)
+        schedules = load_sched(dirpath)
+        meta = load_meta(dirpath)
+        dirty = set()
+        ctx = {"idem": idem, "idem_ops": [], "schedules": schedules,
+               "dirty_sched": set(), "sched_dels": set(),
+               "meta": meta, "meta_dirty": False}
+        # Pre-step 1: materialize due schedule occurrences (atomic with cmd)
+        for job in _materialize(schedules, jobs, t)[0]:
+            dirty.add(job["id"])
+        # Pre-step 2: sweep expired leases (past-TTL jobs left for step 3)
+        dirty.update(sweep_expired(jobs, t))
+        # Pre-step 3: sweep expired TTLs
+        for jid in sweep_ttl(jobs, t):
+            dirty.add(jid)
+            _discard_idem_for_job(ctx, jid)
+        for key in sweep_idem(idem, t):
+            ctx["idem_ops"].append((key, None))
+        # Pre-step 4: cascade dependency failures (after TTL)
+        for jid in sweep_dep_failures(jobs):
+            dirty.add(jid)
+            _discard_idem_for_job(ctx, jid)
+        code = COMMANDS[args.cmd](args, jobs, t, dirty, ctx)
+        dirty_sched = ctx["dirty_sched"]
+        sched_dels = ctx["sched_dels"]
+        meta_dirty = ctx.get("meta_dirty")
+        if ctx.get("compact"):
+            write_snapshot(dirpath, jobs, idem, schedules, meta)
+            truncate_wal(dirpath)
+        elif (dirty or dirty_sched or sched_dels or ctx["idem_ops"]
+              or ctx.get("batch") or meta_dirty):
+            ops = []
+            if ctx.get("batch"):
+                ops.append({"op": "upsert_batch", "jobs": ctx["batch"]})
+            for jid in sorted(dirty):
+                if jid in jobs:
+                    ops.append({"op": "upsert", "job": jobs[jid]})
+            for sid in sorted(dirty_sched):
+                if sid in schedules:
+                    ops.append({"op": "sched", "sched": schedules[sid]})
+            for sid in sorted(sched_dels):
+                ops.append({"op": "sched_del", "id": sid})
+            for key, entry in ctx["idem_ops"]:
+                if entry is None:
+                    ops.append({"op": "idem_del", "key": key})
+                else:
+                    ops.append({"op": "idem", "key": key,
+                                "job_id": entry["job_id"],
+                                "lease_expires_at": entry["lease_expires_at"]})
+            if meta_dirty:
+                ops.append({"op": "meta", "meta": {
+                    "paused": bool(meta.get("paused", False)),
+                    "draining": bool(meta.get("draining", False))}})
+            append_ops(dirpath, ops)
+            write_snapshot(dirpath, jobs, idem, schedules, meta)
+        return code
+    finally:
+        lockfh.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+

@@ -1,0 +1,30 @@
+{
+  "score": 1.0,
+  "categories": {
+    "batch": 1.0,
+    "cancel": 1.0,
+    "claim_batch": 1.0,
+    "cli": 1.0,
+    "concurrency": 1.0,
+    "core": 1.0,
+    "dedupe": 1.0,
+    "deps": 1.0,
+    "drain": 1.0,
+    "fencing": 1.0,
+    "idempotency": 1.0,
+    "interactions": 1.0,
+    "lease": 1.0,
+    "pause": 1.0,
+    "recovery": 1.0,
+    "retries": 1.0,
+    "schedules": 1.0,
+    "scheduling": 1.0,
+    "tags": 1.0,
+    "ttl": 1.0,
+    "tz": 1.0
+  },
+  "failed": [],
+  "passed": 119,
+  "total": 119,
+  "q_bin": "/workspace/reference/q"
+}
