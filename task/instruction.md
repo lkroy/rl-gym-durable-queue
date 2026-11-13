@@ -63,10 +63,15 @@ Fields and defaults:
 | claimed_at         | float or null     | null                             |
 | lease_expires_at   | float or null     | null                             |
 | fence              | int               | 0 (see Fencing tokens)             |
+| depends_on         | list of job ids   | []                               |
 | last_error         | string or null    | null                             |
 | result             | any JSON or null  | null                             |
 
 `status` is one of `pending`, `claimed`, `done`, `dead`.
+
+Every job always carries `depends_on` (a list of job ids it waits on;
+default `[]`). Schedule-materialized jobs always get `depends_on: []`.
+`show` and `claim` output include `depends_on`.
 
 ## Fencing tokens
 
@@ -111,6 +116,26 @@ one atomic unit with the command itself:
    `now - created_at > ttl` and status is `pending` becomes `dead` with
    `last_error` set to `"expired"`. A `claimed` job is exempt while its
    lease is valid; if its lease has expired it is `dead` (not requeued).
+4. **Cascade dependency failures**: any `pending` job whose ANY
+   dependency has status `dead` becomes `dead` with `last_error` exactly
+   `"dependency failed"`. Repeat until fixpoint (cascading through the
+   depends_on graph). Runs after the TTL sweep so a TTL-expired
+   dependency also kills its dependents in the same command.
+
+These pre-steps (materialize, lease sweep, TTL sweep, dep-failure
+cascade) still run when the queue is paused.
+
+## Pause / resume
+
+The queue has a durable paused flag (default false). It MUST survive
+process restart and crash.
+
+- `q pause` — set paused=true, print `paused`, exit 0. Idempotent.
+- `q resume` — set paused=false, print `resumed`, exit 0. Idempotent.
+- While paused: `q claim` MUST exit 1 and stderr MUST contain
+  `queue paused` (even if claimable candidates exist). Do NOT claim.
+- Enqueue, complete, fail, schedule, cancel, list, show, stats, compact
+  (and the other non-claim mutations) still work while paused.
 
 ## Commands
 
@@ -118,7 +143,8 @@ All JSON printed to stdout MUST be parseable JSON. Validation failures MUST
 print a message to stderr.
 
 - `q enqueue --payload JSON [--priority INT] [--delay SEC] [--id ID]
-  [--dedupe-key KEY] [--max-attempts N] [--ttl SEC]`
+  [--dedupe-key KEY] [--max-attempts N] [--ttl SEC]
+  [--depends-on ID[,ID...]]`
   - On success: print the job id followed by a newline to stdout, exit 0.
   - `--payload` MUST be valid JSON, otherwise exit 2.
   - `--id`, when given, MUST match `^[A-Za-z0-9_-]{1,64}$`, otherwise exit 2.
@@ -129,6 +155,13 @@ print a message to stderr.
   - `--ttl`, when given, MUST be > 0, otherwise exit 2. The job expires
     `ttl` seconds after `created_at` (see pre-step 3). A delayed job can
     expire before ever becoming claimable.
+  - `--depends-on` is a comma-separated list of job ids this job waits
+    on (stored as `depends_on`). Validation failures exit 2:
+    - unknown dependency id
+    - self-dependency (an id equal to this job's id)
+    - a cycle in the depends_on graph (including existing jobs); stderr
+      MUST contain `cycle`
+    - an empty token in the list (e.g. `a,,b` or a trailing/leading comma)
   - Dedupe: if `--dedupe-key` is given and a job with the same key exists
     with status `pending` or `claimed`, print THAT job's id, exit 0, and
     create nothing. A key whose previous job is `done` (or `dead`) does NOT
@@ -138,12 +171,18 @@ print a message to stderr.
   - Enqueue many jobs atomically: either ALL of them are created or NONE
     is. `--jobs` MUST be a JSON array, otherwise exit 2.
   - Each element is an object with `payload` (required, any JSON) and
-    optional `priority`, `delay`, `id`, `dedupe_key`, `max_attempts`
-    (same meanings and validation as `enqueue`). Validate EVERY element
-    before creating anything: any invalid element (bad JSON types, bad
-    `id` format, duplicate `id` within the batch or against existing
-    jobs, negative `delay`, `max_attempts` < 1, missing `payload`)
-    aborts the whole batch with exit 2 and creates NOTHING.
+    optional `priority`, `delay`, `id`, `dedupe_key`, `max_attempts`,
+    `depends_on` (a JSON array of job ids; same meaning as enqueue's
+    `--depends-on`). Validate EVERY element before creating anything:
+    any invalid element (bad JSON types, bad `id` format, duplicate `id`
+    within the batch or against existing jobs, negative `delay`,
+    `max_attempts` < 1, missing `payload`, bad `depends_on`) aborts the
+    whole batch with exit 2 and creates NOTHING.
+  - `depends_on` may reference existing jobs OR other elements' ids in
+    the same batch; after dedupe resolution use the resolved id. Validate
+    cycles including the batch-as-a-whole before creating anything; if
+    invalid, create NOTHING (exit 2, stderr contains `cycle` when the
+    failure is a cycle).
   - Dedupe is resolved per element as in `enqueue`: an element whose
     `dedupe_key` matches a `pending`/`claimed` job — including an earlier
     element of the same batch — resolves to that job's id instead of
@@ -187,12 +226,18 @@ print a message to stderr.
   - The mapping MUST be durable (survive crashes) and MUST be safe under
     concurrency: two processes claiming at the same time with the same
     KEY MUST receive the same job, never two different jobs.
-  - Candidates: status `pending` AND `run_at <= now`.
+  - Candidates: status `pending` AND `run_at <= now` AND every id in
+    `depends_on` refers to a job whose status is `done`. A higher-priority
+    job blocked on unmet dependencies MUST NOT prevent claiming a
+    lower-priority job whose dependencies are satisfied.
+  - If the queue is paused: stderr MUST contain `queue paused`, exit 1.
+    Do NOT claim (even when candidates exist).
   - Order: `priority` descending, then `created_at` ascending, then `id`
     ascending. Claim the first candidate(s): set status `claimed`,
     `claimed_at = now`, `lease_expires_at = now + lease`, bump the fence.
   - Print the full job object as JSON (for `--count N`, a JSON array of
-    the claimed job objects in claim order), exit 0.
+    the claimed job objects in claim order), exit 0. The job object
+    includes `depends_on`.
   - If no candidate: stderr MUST contain `no jobs available`, exit 1.
 
 - `q complete ID --fence F [--result JSON]`
@@ -295,13 +340,33 @@ print a message to stderr.
     in compacted form so that the total bytes stored under `$QDATA_DIR`
     shrink. Print `ok`, exit 0.
 
+- `q pause` / `q resume`
+  - See Pause / resume above.
+
+- `q cancel ID [--cascade]`
+  - Unknown id → exit 4.
+  - Target MUST have status `pending`, otherwise stderr MUST contain
+    `not pending`, exit 3.
+  - Sets status `dead`, `last_error` = `"cancelled"`, discards any
+    idempotency mappings for the cancelled job(s), exit 0.
+  - Without `--cascade`: print the id string followed by a newline.
+  - With `--cascade`: also cancel (to `dead` / `"cancelled"`) every
+    still-`pending` job that transitively depends on ID (directly or
+    indirectly). Print a JSON array of cancelled ids sorted by id
+    ascending (include the root).
+  - Interaction with dependency failure: after a non-cascade cancel,
+    dependents that were not cancelled remain `pending` until a later
+    command's pre-step marks them `dead` with `last_error`
+    `"dependency failed"`.
+
 - Any unknown command: exit 2.
 
 ## Exit codes
 
 - 0: success
-- 1: no jobs available (claim found no candidate)
+- 1: no jobs available (claim found no candidate), or queue paused
 - 2: usage / validation error
 - 3: state conflict (complete/fail/extend-lease on a job that is not
-  claimed, or presented with a stale fence token)
+  claimed, or presented with a stale fence token; cancel on a
+  non-pending job)
 - 4: not found (unknown job id)

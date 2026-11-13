@@ -192,3 +192,30 @@ acceptance_criteria:
       - test_cli.py::test_claim_empty
       - test_cli.py::test_complete_pending_conflict
       - test_cli.py::test_show_unknown
+
+  REQ-DEPS:
+    description: Jobs carry depends_on (default []); enqueue --depends-on and batch depends_on; claimable only when pending, run_at<=now, and every dependency is done; unmet higher-priority deps do not block lower-priority ready jobs; unknown/self/empty/cycle deps -> exit 2 (cycle stderr contains cycle); batch validates cycles as a whole before creating anything; pending jobs whose any dependency is dead become dead with last_error "dependency failed" (cascading fixpoint after TTL sweep); show/claim include depends_on; schedule-materialized jobs get depends_on [].
+    checks:
+      - test_deps.py::test_blocked_until_dependency_done
+      - test_deps.py::test_priority_skipped_over_unmet_deps
+      - test_deps.py::test_cycle_rejected
+      - test_deps.py::test_unknown_dep_rejected
+      - test_deps.py::test_dep_dead_cascades_dependent
+      - test_deps.py::test_batch_depends_on_earlier_element
+      - test_deps.py::test_ttl_expiry_of_dep_kills_dependent
+
+  REQ-PAUSE:
+    description: q pause / q resume set a durable paused flag (survives process restart); claim while paused -> exit 1, stderr contains "queue paused", does not claim; enqueue and other non-claim commands still work while paused; pre-steps still run while paused.
+    checks:
+      - test_pause.py::test_claim_rejected_while_paused
+      - test_pause.py::test_pause_survives_new_process
+      - test_pause.py::test_enqueue_while_paused_then_resume_claim
+      - test_pause.py::test_resume_then_claim_succeeds
+
+  REQ-CANCEL:
+    description: q cancel ID [--cascade] requires pending (else "not pending" exit 3); unknown id -> 4; sets dead/last_error "cancelled"; without --cascade prints id; with --cascade also cancels transitive pending dependents and prints sorted JSON id array including root; discard idempotency mappings; non-cascade leave dependents to die later via dependency-failed pre-step.
+    checks:
+      - test_cancel.py::test_cancel_pending_to_dead_cancelled
+      - test_cancel.py::test_cancel_claimed_not_pending
+      - test_cancel.py::test_cascade_cancels_transitive_pending
+      - test_cancel.py::test_without_cascade_dependent_becomes_dependency_failed

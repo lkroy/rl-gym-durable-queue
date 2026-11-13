@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Generate the 17 mutant copies of reference/q (one realistic bug each).
+"""Generate the mutant copies of reference/q (one realistic bug each).
 
 Run from the repo root: python3 evaluation/mutants/make_mutants.py
-Idempotent: rewrites evaluation/mutants/m0* and mutants.yml.
+Idempotent: rewrites evaluation/mutants/m* and mutants.yml.
 """
 import os
 import re
@@ -106,7 +106,8 @@ mutant("m07_delay",
        lambda s: sub_once(
            s,
            "    cands = [j for j in jobs.values()\n"
-           "             if j[\"status\"] == \"pending\" and j[\"run_at\"] <= t]",
+           "             if (j[\"status\"] == \"pending\" and j[\"run_at\"] <= t\n"
+           "                 and _deps_satisfied(jobs, j, t))]",
            "    cands = [j for j in jobs.values()\n"
            "             if j[\"status\"] == \"pending\"]  # BUG: run_at ignored"))
 
@@ -117,14 +118,14 @@ mutant("m08_compact",
        lambda s: sub_once(
            s,
            '        if ctx.get("compact"):\n'
-           '            write_snapshot(dirpath, jobs, idem, schedules)\n'
+           '            write_snapshot(dirpath, jobs, idem, schedules, meta)\n'
            '            truncate_wal(dirpath)',
            '        if ctx.get("compact"):\n'
            '            # BUG: compact archives away non-pending jobs\n'
            '            write_snapshot(dirpath, {jid: j\n'
            '                                     for jid, j in jobs.items()\n'
            '                                     if j["status"] == "pending"},\n'
-           '                             idem, {})\n'
+           '                             idem, {}, meta)\n'
            '            truncate_wal(dirpath)'))
 
 
@@ -235,6 +236,46 @@ mutant("m17_batch_claim",
            "        cands.sort(key=lambda j: (-j[\"priority\"], j[\"created_at\"], j[\"id\"]))\n"
            "    else:\n"
            "        cands.sort(key=lambda j: (j[\"created_at\"], j[\"id\"]))  # BUG: batch claim ignores priority"))
+
+
+# 18. claim ignores depends_on (claims blocked jobs)
+mutant("m18_deps",
+       "claim ignores depends_on (claims blocked jobs)",
+       ["test_deps.py::test_blocked_until_dependency_done"],
+       lambda s: sub_once(
+           s,
+           "    cands = [j for j in jobs.values()\n"
+           "             if (j[\"status\"] == \"pending\" and j[\"run_at\"] <= t\n"
+           "                 and _deps_satisfied(jobs, j, t))]",
+           "    cands = [j for j in jobs.values()\n"
+           "             if j[\"status\"] == \"pending\" and j[\"run_at\"] <= t]  # BUG: depends_on ignored"))
+
+
+# 19. pause flag not persisted (only in-memory / not loaded)
+mutant("m19_pause",
+       "pause flag not persisted (only in-memory / not loaded)",
+       ["test_pause.py::test_pause_survives_new_process"],
+       lambda s: replace_function(
+           s, "load_meta",
+           "def load_meta(dirpath):\n"
+           "    return {\"paused\": False}  # BUG: pause never loaded from disk\n\n"))
+
+
+# 20. --cascade only cancels direct dependents, not transitive
+mutant("m20_cascade",
+       "--cascade only cancels direct dependents, not transitive",
+       ["test_cancel.py::test_cascade_cancels_transitive_pending"],
+       lambda s: replace_function(
+           s, "_transitive_pending_dependents",
+           "def _transitive_pending_dependents(jobs, root_id):\n"
+           "    # BUG: only direct dependents, not transitive\n"
+           "    out = []\n"
+           "    for job in jobs.values():\n"
+           "        if job[\"status\"] != \"pending\":\n"
+           "            continue\n"
+           "        if root_id in (job.get(\"depends_on\") or []):\n"
+           "            out.append(job[\"id\"])\n"
+           "    return out\n\n"))
 
 
 def main():

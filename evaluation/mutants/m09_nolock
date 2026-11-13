@@ -94,6 +94,8 @@ def _well_formed_op(obj):
                 and bool(obj["sched"].get("id")))
     if op == "sched_del":
         return isinstance(obj.get("id"), str)
+    if op == "meta":
+        return isinstance(obj.get("meta"), dict)
     return False
 
 
@@ -271,6 +273,43 @@ def load_idem(dirpath):
     return idem
 
 
+def _load_meta_snapshot(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+    except (FileNotFoundError, ValueError, OSError):
+        return {"paused": False}
+    meta = obj.get("meta") if isinstance(obj, dict) else None
+    if not isinstance(meta, dict):
+        return {"paused": False}
+    return {"paused": bool(meta.get("paused", False))}
+
+
+def _load_wal_meta(path):
+    _truncate_torn_tail(path)
+    meta = None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                if obj.get("op") == "meta" and isinstance(obj.get("meta"), dict):
+                    meta = {"paused": bool(obj["meta"].get("paused", False))}
+    except FileNotFoundError:
+        pass
+    return meta
+
+
+def load_meta(dirpath):
+    meta = _load_meta_snapshot(os.path.join(dirpath, "snapshot.json"))
+    wal_meta = _load_wal_meta(os.path.join(dirpath, "wal.log"))
+    if wal_meta is not None:
+        meta = wal_meta
+    return meta
+
+
 def append_ops(dirpath, ops):
     ops = list(ops)
     if not ops:
@@ -284,11 +323,14 @@ def append_ops(dirpath, ops):
     _fsync_dir(dirpath)
 
 
-def write_snapshot(dirpath, jobs, idem, schedules):
+def write_snapshot(dirpath, jobs, idem, schedules, meta=None):
+    if meta is None:
+        meta = {"paused": False}
     path = os.path.join(dirpath, "snapshot.json")
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"jobs": jobs, "idem": idem, "schedules": schedules},
+        json.dump({"jobs": jobs, "idem": idem, "schedules": schedules,
+                   "meta": {"paused": bool(meta.get("paused", False))}},
                   f, separators=(",", ":"))
         f.flush()
         os.fsync(f.fileno())
@@ -354,6 +396,123 @@ def sweep_ttl(jobs, t):
             job["last_error"] = "expired"
             changed.append(job["id"])
     return changed
+
+
+def sweep_dep_failures(jobs):
+    """Cascade: pending jobs with any dead dependency become dead.
+
+    Repeats until fixpoint. Returns ids changed. last_error is exactly
+    'dependency failed'.
+    """
+    changed = []
+    progressed = True
+    while progressed:
+        progressed = False
+        for job in jobs.values():
+            if job["status"] != "pending":
+                continue
+            deps = job.get("depends_on") or []
+            if not deps:
+                continue
+            if any(jobs.get(d, {}).get("status") == "dead" for d in deps):
+                job["status"] = "dead"
+                job["last_error"] = "dependency failed"
+                changed.append(job["id"])
+                progressed = True
+    return changed
+
+
+def _deps_satisfied(jobs, job, t):
+    """True if job is claimable w.r.t. depends_on (all deps done)."""
+    for dep_id in job.get("depends_on") or []:
+        dep = jobs.get(dep_id)
+        if dep is None or dep.get("status") != "done":
+            return False
+    return True
+
+
+def _parse_depends_on_cli(text):
+    """Parse --depends-on ID[,ID...]. Empty tokens -> exit 2."""
+    if text is None:
+        return []
+    parts = text.split(",")
+    if any(p.strip() == "" for p in parts) or text.strip() == "":
+        die("empty depends_on token", 2)
+    return [p.strip() for p in parts]
+
+
+def _validate_depends_on(jid, deps, jobs, extra_edges=None):
+    """Validate depends_on list against known jobs (+ optional extra edges).
+
+    extra_edges: dict id -> list of dep ids for jobs not yet in `jobs`
+    (used by batch validation). Dies exit 2 on unknown / self / cycle /
+    empty token.
+    """
+    if not isinstance(deps, list):
+        die("depends_on must be a list of job ids", 2)
+    for d in deps:
+        if not isinstance(d, str) or d == "":
+            die("empty depends_on token", 2)
+        if d == jid:
+            die("self-dependency: %s" % jid, 2)
+        known = d in jobs or (extra_edges is not None and d in extra_edges)
+        if not known:
+            die("unknown dependency id: %s" % d, 2)
+    # Cycle check on the graph of depends_on edges (A -> B means A waits on B).
+    graph = {}
+    for existing in jobs.values():
+        graph[existing["id"]] = list(existing.get("depends_on") or [])
+    if extra_edges is not None:
+        for eid, edeps in extra_edges.items():
+            graph[eid] = list(edeps)
+    if jid is not None:
+        graph[jid] = list(deps)
+
+    def _has_cycle():
+        WHITE, GRAY, BLACK = 0, 1, 2
+        color = {n: WHITE for n in graph}
+
+        def dfs(n):
+            color[n] = GRAY
+            for m in graph.get(n, []):
+                if m not in color:
+                    continue
+                if color[m] == GRAY:
+                    return True
+                if color[m] == WHITE and dfs(m):
+                    return True
+            color[n] = BLACK
+            return False
+
+        return any(color[n] == WHITE and dfs(n) for n in graph)
+
+    if _has_cycle():
+        die("cycle in depends_on graph", 2)
+
+
+def _transitive_pending_dependents(jobs, root_id):
+    """Pending jobs that transitively depend on root_id (not including root)."""
+    rev = {}
+    for job in jobs.values():
+        for d in job.get("depends_on") or []:
+            rev.setdefault(d, []).append(job["id"])
+    out = []
+    stack = list(rev.get(root_id, []))
+    seen = set()
+    while stack:
+        nid = stack.pop()
+        if nid in seen:
+            continue
+        seen.add(nid)
+        job = jobs.get(nid)
+        if job is None:
+            continue
+        if job["status"] == "pending":
+            out.append(nid)
+        for child in rev.get(nid, []):
+            if child not in seen:
+                stack.append(child)
+    return out
 
 
 def _parse_cron_field(text, lo, hi, name):
@@ -500,6 +659,7 @@ def _materialize(schedules, jobs, t):
                 "dedupe_key": None,
                 "ttl": None,
                 "fence": 0,
+                "depends_on": [],
                 "claimed_at": None,
                 "lease_expires_at": None,
                 "last_error": None,
@@ -581,6 +741,8 @@ def cmd_enqueue(args, jobs, t, dirty, ctx):
         die("max_attempts must be >= 1", 2)
     if args.ttl is not None and args.ttl <= 0:
         die("ttl must be > 0", 2)
+    deps = _parse_depends_on_cli(getattr(args, "depends_on", None))
+    _validate_depends_on(jid, deps, jobs)
     if args.dedupe_key is not None:
         hit = _find_dedupe(jobs, args.dedupe_key)
         if hit is not None:
@@ -598,6 +760,7 @@ def cmd_enqueue(args, jobs, t, dirty, ctx):
         "dedupe_key": args.dedupe_key,
         "ttl": args.ttl,
         "fence": 0,
+        "depends_on": deps,
         "claimed_at": None,
         "lease_expires_at": None,
         "last_error": None,
@@ -636,9 +799,17 @@ def _validate_batch_element(el, i, jobs, seen_ids):
     dedupe_key = el.get("dedupe_key")
     if dedupe_key is not None and not isinstance(dedupe_key, str):
         die("invalid jobs: element %d has bad dedupe_key" % i, 2)
+    depends_on = el.get("depends_on", [])
+    if depends_on is None:
+        depends_on = []
+    if not isinstance(depends_on, list):
+        die("invalid jobs: element %d has bad depends_on" % i, 2)
+    for d in depends_on:
+        if not isinstance(d, str) or d == "":
+            die("empty depends_on token", 2)
     return {"payload": el["payload"], "priority": priority, "delay": delay,
             "max_attempts": max_attempts, "id": jid,
-            "dedupe_key": dedupe_key}
+            "dedupe_key": dedupe_key, "depends_on": depends_on}
 
 
 def cmd_enqueue_batch(args, jobs, t, dirty, ctx):
@@ -652,17 +823,63 @@ def cmd_enqueue_batch(args, jobs, t, dirty, ctx):
     seen_ids = set()
     specs = [_validate_batch_element(el, i, jobs, seen_ids)
              for i, el in enumerate(items)]
-    # Pass 2: create in order; dedupe resolves per element (an earlier
-    # element of this batch counts as an existing job).
-    ids = []
-    new_jobs = []
+    # Pass 1b: resolve ids (including dedupe) and depends_on; validate
+    # cycles for the batch-as-a-whole BEFORE creating anything.
+    sim_jobs = dict(jobs)
+    resolved_ids = []
+    will_create = []
+    # Map a user-declared earlier-element id -> its resolved job id
+    # (identity when created; the hit's id when deduped).
+    declared_to_resolved = {}
     for spec in specs:
         if spec["dedupe_key"] is not None:
-            hit = _find_dedupe(jobs, spec["dedupe_key"])
+            hit = _find_dedupe(sim_jobs, spec["dedupe_key"])
             if hit is not None:
-                ids.append(hit["id"])
+                resolved_ids.append(hit["id"])
+                will_create.append(False)
+                if spec["id"] is not None:
+                    declared_to_resolved[spec["id"]] = hit["id"]
                 continue
-        jid = spec["id"] if spec["id"] is not None else _new_id(jobs)
+        jid = spec["id"] if spec["id"] is not None else _new_id(sim_jobs)
+        sim_jobs[jid] = {
+            "id": jid, "status": "pending", "dedupe_key": spec["dedupe_key"],
+            "depends_on": [],
+        }
+        resolved_ids.append(jid)
+        will_create.append(True)
+        if spec["id"] is not None:
+            declared_to_resolved[spec["id"]] = jid
+
+    resolved_deps = []
+    extra_edges = {}
+    # All new batch ids are visible for depends_on resolution so the
+    # batch-as-a-whole can be cycle-checked before creating anything.
+    # (Forward refs within the batch are allowed; unknown outside the
+    # batch still fails.)
+    for i, spec in enumerate(specs):
+        if will_create[i]:
+            extra_edges[resolved_ids[i]] = []  # placeholder ids
+    for i, spec in enumerate(specs):
+        # Remap depends_on tokens that name batch elements to resolved ids.
+        deps = [declared_to_resolved.get(d, d) for d in spec["depends_on"]]
+        resolved_deps.append(deps)
+        if not will_create[i]:
+            continue
+        jid = resolved_ids[i]
+        extra_edges[jid] = deps
+    # Validate each new job's deps and the whole-batch graph once.
+    if extra_edges:
+        for jid, deps in list(extra_edges.items()):
+            _validate_depends_on(jid, deps, jobs, extra_edges=extra_edges)
+
+    # Pass 2: create in order.
+    ids = []
+    new_jobs = []
+    for i, spec in enumerate(specs):
+        if not will_create[i]:
+            ids.append(resolved_ids[i])
+            continue
+        jid = resolved_ids[i]
         job = {
             "id": jid,
             "payload": spec["payload"],
@@ -675,6 +892,7 @@ def cmd_enqueue_batch(args, jobs, t, dirty, ctx):
             "dedupe_key": spec["dedupe_key"],
             "ttl": None,
             "fence": 0,
+            "depends_on": list(resolved_deps[i]),
             "claimed_at": None,
             "lease_expires_at": None,
             "last_error": None,
@@ -717,6 +935,8 @@ def cmd_claim(args, jobs, t, dirty, ctx):
         _check_id_format(key)
         if count > 1:
             die("--idempotency-key cannot be combined with --count > 1", 2)
+    if ctx["meta"].get("paused"):
+        die("queue paused", 1)
     idem = ctx["idem"]
     if key is not None:
         entry = idem.get(key)
@@ -730,7 +950,8 @@ def cmd_claim(args, jobs, t, dirty, ctx):
                 return 0
         # stale or missing mapping: fall through to a fresh claim
     cands = [j for j in jobs.values()
-             if j["status"] == "pending" and j["run_at"] <= t]
+             if (j["status"] == "pending" and j["run_at"] <= t
+                 and _deps_satisfied(jobs, j, t))]
     cands.sort(key=lambda j: (-j["priority"], j["created_at"], j["id"]))
     if not cands:
         die("no jobs available", 1)
@@ -751,6 +972,48 @@ def cmd_claim(args, jobs, t, dirty, ctx):
         sys.stdout.write(json.dumps(picked[0]) + "\n")
     else:
         sys.stdout.write(json.dumps(picked) + "\n")
+    return 0
+
+
+def cmd_pause(args, jobs, t, dirty, ctx):
+    if not ctx["meta"].get("paused"):
+        ctx["meta"]["paused"] = True
+        ctx["meta_dirty"] = True
+    sys.stdout.write("paused\n")
+    return 0
+
+
+def cmd_resume(args, jobs, t, dirty, ctx):
+    if ctx["meta"].get("paused"):
+        ctx["meta"]["paused"] = False
+        ctx["meta_dirty"] = True
+    sys.stdout.write("resumed\n")
+    return 0
+
+
+def cmd_cancel(args, jobs, t, dirty, ctx):
+    job = _get_job_or_die(jobs, args.id)
+    if job["status"] != "pending":
+        die("not pending", 3)
+    cascade = bool(getattr(args, "cascade", False))
+    to_cancel = [args.id]
+    if cascade:
+        to_cancel.extend(_transitive_pending_dependents(jobs, args.id))
+    cancelled = []
+    for jid in to_cancel:
+        j = jobs[jid]
+        if j["status"] != "pending":
+            continue
+        j["status"] = "dead"
+        j["last_error"] = "cancelled"
+        dirty.add(jid)
+        _discard_idem_for_job(ctx, jid)
+        cancelled.append(jid)
+    cancelled.sort()
+    if cascade:
+        sys.stdout.write(json.dumps(cancelled) + "\n")
+    else:
+        sys.stdout.write(args.id + "\n")
     return 0
 
 
@@ -913,6 +1176,9 @@ COMMANDS = {
     "unschedule": cmd_unschedule,
     "extend-lease": cmd_extend_lease,
     "compact": cmd_compact,
+    "pause": cmd_pause,
+    "resume": cmd_resume,
+    "cancel": cmd_cancel,
 }
 
 
@@ -927,6 +1193,7 @@ def parse_args(argv):
     e.add_argument("--dedupe-key", default=None)
     e.add_argument("--max-attempts", type=int, default=3)
     e.add_argument("--ttl", type=float, default=None)
+    e.add_argument("--depends-on", dest="depends_on", default=None)
     b = sub.add_parser("enqueue-batch", allow_abbrev=False)
     b.add_argument("--jobs", required=True)
     li = sub.add_parser("list", allow_abbrev=False)
@@ -962,6 +1229,11 @@ def parse_args(argv):
     x.add_argument("--fence", type=int, default=None)
     x.add_argument("--lease", type=float, required=True)
     sub.add_parser("compact", allow_abbrev=False)
+    sub.add_parser("pause", allow_abbrev=False)
+    sub.add_parser("resume", allow_abbrev=False)
+    ca = sub.add_parser("cancel", allow_abbrev=False)
+    ca.add_argument("id")
+    ca.add_argument("--cascade", action="store_true", default=False)
     args = p.parse_args(argv)
     if args.cmd is None:
         p.error("unknown command")
@@ -977,9 +1249,11 @@ def main(argv):
         jobs = load_state(dirpath)
         idem = load_idem(dirpath)
         schedules = load_sched(dirpath)
+        meta = load_meta(dirpath)
         dirty = set()
         ctx = {"idem": idem, "idem_ops": [], "schedules": schedules,
-               "dirty_sched": set(), "sched_dels": set()}
+               "dirty_sched": set(), "sched_dels": set(),
+               "meta": meta, "meta_dirty": False}
         # Pre-step 1: materialize due schedule occurrences (atomic with cmd)
         for job in _materialize(schedules, jobs, t)[0]:
             dirty.add(job["id"])
@@ -991,13 +1265,19 @@ def main(argv):
             _discard_idem_for_job(ctx, jid)
         for key in sweep_idem(idem, t):
             ctx["idem_ops"].append((key, None))
+        # Pre-step 4: cascade dependency failures (after TTL)
+        for jid in sweep_dep_failures(jobs):
+            dirty.add(jid)
+            _discard_idem_for_job(ctx, jid)
         code = COMMANDS[args.cmd](args, jobs, t, dirty, ctx)
         dirty_sched = ctx["dirty_sched"]
         sched_dels = ctx["sched_dels"]
+        meta_dirty = ctx.get("meta_dirty")
         if ctx.get("compact"):
-            write_snapshot(dirpath, jobs, idem, schedules)
+            write_snapshot(dirpath, jobs, idem, schedules, meta)
             truncate_wal(dirpath)
-        elif dirty or dirty_sched or sched_dels or ctx["idem_ops"] or ctx.get("batch"):
+        elif (dirty or dirty_sched or sched_dels or ctx["idem_ops"]
+              or ctx.get("batch") or meta_dirty):
             ops = []
             if ctx.get("batch"):
                 ops.append({"op": "upsert_batch", "jobs": ctx["batch"]})
@@ -1016,8 +1296,11 @@ def main(argv):
                     ops.append({"op": "idem", "key": key,
                                 "job_id": entry["job_id"],
                                 "lease_expires_at": entry["lease_expires_at"]})
+            if meta_dirty:
+                ops.append({"op": "meta", "meta": {
+                    "paused": bool(meta.get("paused", False))}})
             append_ops(dirpath, ops)
-            write_snapshot(dirpath, jobs, idem, schedules)
+            write_snapshot(dirpath, jobs, idem, schedules, meta)
         return code
     finally:
         lockfh.close()
