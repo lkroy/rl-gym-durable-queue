@@ -19,46 +19,37 @@ exactly 1.0.
 ## Mutant verification
 
 `mutant-check-v3.log` records `npm run check:mutants` against **20 mutants**.
-Each mutant must score `< 1.0` and fail its mapped `must_fail` checks.
+
+Result: **ALL MUTANTS CAUGHT (20/20)**.
+
+Method: targeted runs of each mutant's mapped `must_fail` checks with
+`Q_BIN=<mutant>` (the default `check_mutants.py` mode). Those checks are
+score-bearing, so a failed mapped check implies overall score `< 1.0`.
+Set `MUTANT_FULL=1` to additionally run the full weighted suite per mutant
+(slow: schedule tests wait on minute boundaries).
 
 New v3 mutants:
 - m18_deps — claim ignores `depends_on`
 - m19_pause — pause flag not persisted across process restart
 - m20_cascade — `--cascade` only cancels direct dependents
 
-`evaluation/score.py` now uses a unique tempfile for the junit report so
-overlapping score runs cannot corrupt each other via a shared `.junit.xml`.
+`evaluation/score.py` uses a unique tempfile for the junit report so
+overlapping score runs cannot corrupt each other.
 
 ## Frontier-model difficulty evaluation
 
-### Historical one-shot (pre-OpenHands) — rescoring against v3
+### Blocker: no LLM API keys available
 
-`gemini-2.5-flash-run2.response.txt` was the model's one-shot solution for
-the *prior* hardened spec (no deps/pause/cancel). Re-scored unchanged against
-the v3 suite (`gemini-2.5-flash-run2-rescored-v3.json`):
+The task author / Cloud Agent environment **does not have frontier-model API
+keys**. Therefore the contracted protocol — two different frontier models,
+medium reasoning, single-pass OpenHands, both scores `< 0.30` — **cannot be
+executed here**. No scores are invented.
 
-- **Score: 0.2198 (21/93)** — below the 0.30 gate
-- Failure categories include: pause 0.0, cancel 0.0, fencing 0.0,
-  concurrency 0.0, retries 0.0, deps 0.29, recovery 0.4, cli 0.25, tz 0.0
-
-This is evidence the v3 surface is hard, but it is **not** a substitute for
-the contracted protocol (two different frontier models, OpenHands, single
-pass on the current `task/instruction.md`).
-
-### Contracted OpenHands dual-model runs
-
-**Status: blocked on API credentials in this environment.**
-
-Harness is ready:
-- `npm run generate` → `scripts/generate.sh` (OpenHands headless / local runtime)
-- `npm run generate:two` → `scripts/eval_two_models.sh` (model A + model B)
-
-Required secrets (requested via Cloud Agent setup actions):
-- `LLM_API_KEY` (and `LLM_MODEL`) for model A
-- `LLM_API_KEY_B` or a second provider key for a *different* frontier model B
+Harness is ready for when keys exist:
+- `npm run generate` → `scripts/generate.sh` (OpenHands local/process runtime)
+- `npm run generate:two` → `scripts/eval_two_models.sh`
 
 ```bash
-# Model A
 export LLM_MODEL="anthropic/claude-sonnet-4-20250514"
 export LLM_API_KEY="<key-A>"
 export SOLUTION_DIR=/tmp/solution-a
@@ -66,8 +57,7 @@ export OPENHANDS_LOG_NAME=openhands-model-a.log
 npm run generate
 Q_BIN=/tmp/solution-a/q npm run score | tee evaluation/proof-of-work/score-model-a.json
 
-# Model B (different frontier model)
-export LLM_MODEL="openai/gpt-4.1"
+export LLM_MODEL="openai/gpt-4.1"   # different frontier model
 export LLM_API_KEY="<key-B>"
 export SOLUTION_DIR=/tmp/solution-b
 export OPENHANDS_LOG_NAME=openhands-model-b.log
@@ -75,12 +65,26 @@ npm run generate
 Q_BIN=/tmp/solution-b/q npm run score | tee evaluation/proof-of-work/score-model-b.json
 ```
 
-Both scores must be **< 0.30**. Record model names, OpenHands logs, scores,
-and failure categories here when the runs complete.
+### Supporting difficulty evidence (not a substitute for OpenHands)
+
+`gemini-2.5-flash-run2.response.txt` was a one-shot solution for the *prior*
+hardened spec. Re-scored unchanged against the v3 suite
+(`gemini-2.5-flash-run2-rescored-v3.json`):
+
+- **Score: 0.2198 (21/93)** — below the 0.30 gate
+- Failures include pause/cancel/fencing/concurrency/retries/tz at 0.0 and
+  weak deps/recovery/cli
+
+This supports that the v3 surface is hard, but it is **not** two different
+frontier models on the current instruction via OpenHands.
+
+Per the application brief, post-submission review runs two top frontier
+models (e.g. Opus / Astra, high reasoning) with an expected bar of `< 40%`.
+That is the appropriate harness for the remaining difficulty gate.
 
 ## Access / privacy notes
 
 - Application requires a **private** GitHub repository and collaborator access
   for `content.team@problemsetters.com`.
-- `content-team-hr` currently has write access on this repo; confirm that
-  covers the required mailbox, and set the repository visibility to private.
+- `content-team-hr` currently has write access; confirm that covers the
+  required mailbox, and set repository visibility to private.

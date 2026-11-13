@@ -28,7 +28,7 @@ recovery, and `flock`-guarded concurrency.
 │   ├── acceptance-criteria.yml
 │   ├── scoring.yml         # weights sum to exactly 1.0
 │   ├── mutants/            # buggy copies of q + mutants.yml
-│   └── proof-of-work/      # real run logs; model eval pending API keys
+│   └── proof-of-work/      # reference/mutant logs; OpenHands eval needs API keys
 ├── app-setup/              # build.sh / reset.sh / start.sh lifecycle scripts
 └── scripts/                # generate.sh (real OpenHands runner), check_reference.sh
 ```
