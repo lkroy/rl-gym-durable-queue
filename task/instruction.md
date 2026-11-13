@@ -1,48 +1,125 @@
 # Durable Job Queue — `q`
 
-Build a single-executable command-line program named `q` that manages a
-persistent job queue on disk. Python 3, standard library only.
+## Goal
 
-Place the executable at the solution root (it will be invoked as `./q` or
-via an absolute path). It MUST be executable (`chmod +x`).
+Build a single-executable command-line program named `q` that workers use as
+a durable, crash-safe job queue: enqueue work, claim it under a lease,
+complete or fail it, and keep every acknowledged job intact across process
+deaths, concurrent workers, and operator control (pause / drain / cancel).
 
-## State directory
+Python 3, standard library only. Place the executable at the solution root
+(invoked as `./q` or via an absolute path). It MUST be executable
+(`chmod +x`).
+
+## User outcomes
+
+Operators and workers must be able to:
+
+- **Enqueue and batch-enqueue** work with priorities, delays, dedupe keys,
+  TTLs, tags, and dependency edges.
+- **Claim** ready work (single or multi), **complete** it with a result, or
+  **fail** it with exponential backoff / dead-lettering.
+- **Survive crashes**: once a command exits 0, its effects remain visible
+  after SIGKILL of any later process; an interrupted command never leaves
+  the queue unreadable or half-applied.
+- **Avoid double delivery**: concurrent claimants never receive the same
+  job twice; fencing tokens reject stale workers after reclaim.
+- **Pause / drain / resume** the queue for operational control without
+  losing in-flight or already-enqueued work.
+- **Schedule** recurring jobs (cron, timezone-aware) that materialize as
+  ordinary jobs when due.
+- **Cancel** pending work (optionally cascading through dependents) and
+  partition work with **tags**.
+
+## Competing requirements (tension)
+
+These goals pull in opposite directions; a correct `q` satisfies all of
+them observably:
+
+- **Reclaim disk** (`q compact` must shrink bytes under `$QDATA_DIR`) vs
+  **never lose jobs** (compact mid-SIGKILL still keeps every acknowledged
+  job; single-file loss while idle still leaves the queue intact).
+- **Pause blocks new claims** vs **in-flight idempotent retries still
+  work**: while paused, a new claim fails with `queue paused`, but
+  `claim --idempotency-key KEY` that maps to a currently claimed,
+  unexpired job MUST return that same job (same fence, lease not
+  extended).
+- **Erase / cancel** pending work (and optional cascade) without harming
+  unrelated jobs, claimed dependents, or siblings that do not depend on
+  the cancelled root.
+- **Durable redundancy** (survive loss of any one state file while idle)
+  vs **compact** storage after growth.
+
+## Rules
+
+How state is stored under `$QDATA_DIR` is entirely up to you — names,
+formats, and structures are your design. What is graded is that these
+**outcomes** hold:
+
+### State directory
 
 - The state directory comes from the `$QDATA_DIR` environment variable.
-  If unset, default to `./.qdata` (relative to the current working directory).
+  If unset, default to `./.qdata` (relative to the current working
+  directory).
 - The program MUST create the state directory if it does not exist.
 
-## Durability & crash-recovery contract
+### Durability, crash safety, concurrency, redundancy
 
-How state is stored under `$QDATA_DIR` is entirely up to you — file names,
-formats, and data structures are your design choice. What is graded is that
-these guarantees hold observably:
-
-- Durability: once a command has exited 0, its effects MUST survive the
-  process being killed (SIGKILL) at any later moment. Data MUST reach
-  durable storage (fsync) before the command reports success.
-- Crash atomicity: if a `q` process is killed (SIGKILL) in the middle of ANY
-  command, the queue MUST NOT be left half-written or unreadable. The very
-  next `q` invocation MUST exit 0 and see every previously acknowledged job
-  intact; the interrupted operation itself MUST have taken effect at most
-  once (it may have fully completed or not at all — never partially, never
-  duplicated).
-- Redundancy: the queue must keep every acknowledged job intact and remain
-  fully operational even if any single file under the state directory is
-  lost while no `q` process is running. Design your storage so that no
-  single file is a single point of failure.
-- Partial writes: a crash can interrupt a write at any byte, leaving a
+- **Durability**: once a command has exited 0, its effects MUST survive
+  the process being killed (SIGKILL) at any later moment. Effects are
+  not considered successful until they will outlive that kill.
+- **Crash atomicity**: if a `q` process is killed (SIGKILL) in the middle
+  of ANY command, the queue MUST NOT be left half-written or unreadable.
+  The very next `q` invocation MUST exit 0 and see every previously
+  acknowledged job intact; the interrupted operation itself MUST have
+  taken effect at most once (fully completed or not at all — never
+  partially, never duplicated).
+- **Redundancy**: the queue must keep every acknowledged job intact and
+  remain fully operational even if any single file under the state
+  directory is lost while no `q` process is running. No single file may
+  be a single point of failure for acknowledged work.
+- **Torn writes**: a crash can interrupt a write at any byte, leaving a
   state file with a partially-written trailing record. The next command
-  MUST recover from this automatically — discarding the partial data,
-  keeping every acknowledged job intact, and exiting 0.
-- `q compact` MUST preserve every job, whatever its status, and MUST reduce
-  the total bytes stored under `$QDATA_DIR` once the queue has grown through
-  many operations (it is the mechanism that reclaims space from the
-  redundant storage above). A process killed (SIGKILL) in the middle of
-  `q compact` MUST NOT lose any acknowledged job.
-- Concurrency: multiple `q` processes running at the same time MUST NEVER
-  deliver (claim) the same job twice, and concurrent mutations MUST NOT
-  corrupt the queue. Serialize access with OS-level locking.
+  MUST recover automatically — discarding the partial data, keeping every
+  acknowledged job intact, and exiting 0.
+- **Compact**: `q compact` MUST preserve every job, whatever its status,
+  and MUST reduce the total bytes stored under `$QDATA_DIR` once the
+  queue has grown through many operations. A process killed (SIGKILL) in
+  the middle of `q compact` MUST NOT lose any acknowledged job.
+- **Concurrency**: multiple `q` processes running at the same time MUST
+  NEVER deliver (claim) the same job twice, and concurrent mutations MUST
+  NOT corrupt the queue.
+
+## Background obligations
+
+Before a command's own effects become visible, the following background
+work MUST already have been applied as part of that same successful
+command (one observable unit with the command). These obligations still
+apply when the queue is paused and when it is draining.
+
+- **Due schedules materialize**: for each schedule, every occurrence with
+  time <= now and time > that schedule's `last_materialized` becomes one
+  pending job; `last_materialized` advances to the latest materialized
+  occurrence. Materialization is idempotent across crashes (no duplicate
+  jobs for the same occurrence; no skipped occurrence once acknowledged).
+- **Expired leases reclaim**: any `claimed` job with
+  `lease_expires_at <= now` returns to `pending` (clearing `claimed_at` /
+  `lease_expires_at`), unless it is also past its TTL (see next).
+  Idempotency mappings whose lease expired are discarded.
+- **TTLs expire**: any job with a non-null `ttl` where
+  `now - created_at > ttl` and status is `pending` becomes `dead` with
+  `last_error` exactly `"expired"`. A `claimed` job is exempt while its
+  lease is valid; if its lease has expired it is `dead` (not requeued).
+- **Dependency-failure cascades**: any `pending` job whose ANY dependency
+  has status `dead` becomes `dead` with `last_error` exactly
+  `"dependency failed"`. Repeat until fixpoint through the depends_on
+  graph.
+
+**Ordering rule (TTL before dep-cascade):** a waiter with its own TTL that
+expires becomes `dead` with `last_error` `"expired"` even if its
+dependency is still `pending`. TTL expiry is applied before the
+dependency-failure cascade, so that waiter is not marked
+`"dependency failed"`.
 
 ## Job object
 
@@ -101,41 +178,11 @@ The guarantee this buys: a worker that claimed a job, lost its lease
 `extend-lease` AFTER another worker has reclaimed the job MUST be
 rejected — its fence is stale, and the new holder's work is protected.
 
-## Pre-steps (run at the start of every command)
-
-Before executing any command, `q` MUST perform these steps in order, as
-one atomic unit with the command itself:
-
-1. **Materialize due schedule occurrences** (see `q schedule`): for each
-   schedule, create one pending job per occurrence with time <= now and
-   time > the schedule's `last_materialized`, then advance
-   `last_materialized` to the latest materialized occurrence.
-2. **Sweep expired leases**: any `claimed` job with
-   `lease_expires_at <= now` returns to `pending` (clearing `claimed_at`
-   / `lease_expires_at`), unless it is also past its TTL (see next step).
-   Idempotency mappings whose lease expired are discarded.
-3. **Sweep expired TTLs**: any job with a non-null `ttl` where
-   `now - created_at > ttl` and status is `pending` becomes `dead` with
-   `last_error` set to `"expired"`. A `claimed` job is exempt while its
-   lease is valid; if its lease has expired it is `dead` (not requeued).
-4. **Cascade dependency failures**: any `pending` job whose ANY
-   dependency has status `dead` becomes `dead` with `last_error` exactly
-   `"dependency failed"`. Repeat until fixpoint (cascading through the
-   depends_on graph). Runs after the TTL sweep so a TTL-expired
-   dependency also kills its dependents in the same command.
-
-These pre-steps (materialize, lease sweep, TTL sweep, dep-failure
-cascade) still run when the queue is paused **and** when it is draining.
-A waiter with its own TTL that expires becomes `dead` with
-`last_error` `"expired"` even if its dependency is still `pending`
-(TTL runs before the dep-failure cascade, so the waiter is not marked
-`"dependency failed"`).
-
 ## Pause / resume / drain
 
 Queue meta is `{paused: bool, draining: bool}` (both default false).
-Both flags MUST be durable (survive process restart and crash) and MUST
-be persisted in the same snapshot + WAL meta ops.
+Both flags MUST be durable (survive process restart and crash) along with
+the rest of acknowledged queue state.
 
 - `q pause` — set paused=true, print `paused`, exit 0. Idempotent.
 - `q drain` — set draining=true, print `draining`, exit 0. Idempotent.
@@ -148,6 +195,10 @@ be persisted in the same snapshot + WAL meta ops.
   lease, return THAT job (same fence), exit 0. Do NOT extend the lease.
   This is a retry of in-flight work, not a new claim. Any other key (or
   no key) while paused → `queue paused`.
+- Pause does **not** prevent `complete` or `fail` of an already-claimed
+  job (with a valid fence).
+- Drain does **not** remove or alter already-enqueued jobs; they remain
+  claimable (subject to the usual candidate rules and pause).
 - While draining: `enqueue`, `enqueue-batch`, and `schedule` MUST exit 3
   and stderr MUST contain `draining` (create nothing). claim / complete /
   fail / cancel / list / show / stats / compact / unschedule / pause /
@@ -159,7 +210,7 @@ be persisted in the same snapshot + WAL meta ops.
   (and the other non-claim mutations) still work while paused (but
   enqueue/enqueue-batch/schedule are blocked while draining).
 
-## Commands
+## CLI contract
 
 All JSON printed to stdout MUST be parseable JSON. Validation failures MUST
 print a message to stderr.
@@ -176,8 +227,8 @@ print a message to stderr.
     `created_at + delay` (default delay 0).
   - `--max-attempts` MUST be >= 1, otherwise exit 2.
   - `--ttl`, when given, MUST be > 0, otherwise exit 2. The job expires
-    `ttl` seconds after `created_at` (see pre-step 3). A delayed job can
-    expire before ever becoming claimable.
+    `ttl` seconds after `created_at` (see Background obligations). A
+    delayed job can expire before ever becoming claimable.
   - `--tag TAG`, when given, MUST match `^[A-Za-z0-9_-]{1,32}$`, otherwise
     exit 2. Stored as the job's `tag` (default `null` when omitted).
   - `--depends-on` is a comma-separated list of job ids this job waits
@@ -243,8 +294,9 @@ print a message to stderr.
   - `--idempotency-key`, when given, MUST match `^[A-Za-z0-9_-]{1,64}$`,
     otherwise exit 2. It is only valid with the default `--count 1`;
     combining it with `--count` > 1 is exit 2.
-  - The pre-steps run first (materialization, lease sweep, TTL sweep,
-    dep-failure cascade).
+  - Background obligations run as part of the command (materialize due
+    schedules, reclaim expired leases, expire TTLs, cascade dependency
+    failures) before the claim decision is visible.
   - If KEY is given and maps to a job that is currently `claimed` with an
     unexpired lease, return THAT job (full JSON, same fence), exit 0. Do
     NOT claim a new job and do NOT extend the lease. This gives
@@ -268,6 +320,9 @@ print a message to stderr.
     This is a hard partition: an untagged claim never sees tagged jobs
     and a tagged claim never sees untagged jobs. depends_on / priority /
     run_at / pause / drain still apply on top of the tag filter.
+  - Completing a tagged job MUST NOT affect an untagged pending job (it
+    remains claimable via untagged claim). Completing an untagged job
+    likewise MUST NOT affect tagged pending jobs.
   - A higher-priority job blocked on unmet dependencies MUST NOT prevent
     claiming a lower-priority job whose dependencies are satisfied.
     With `--count N`, skip unmet deps and fill up to N from ready jobs
@@ -358,7 +413,7 @@ print a message to stderr.
   `{schedule_id}-{YYYYMMDDHHMM}` using the occurrence's LOCAL wall-clock
   in the schedule's timezone, which makes materialization idempotent:
   re-running it after a crash MUST NOT create duplicates, and
-  `last_materialized` MUST advance atomically with the created jobs so no
+  `last_materialized` MUST advance together with the created jobs so no
   occurrence is skipped. On the first materialization, only occurrences
   at or after the schedule's creation time are considered (no backfill
   from before the schedule existed).
@@ -378,9 +433,9 @@ print a message to stderr.
     Print the job id, exit 0.
 
 - `q compact`
-  - Reclaim space used by the redundant storage: rewrite the durable state
-    in compacted form so that the total bytes stored under `$QDATA_DIR`
-    shrink. Print `ok`, exit 0.
+  - Reclaim space used by durable redundancy: rewrite state so that the
+    total bytes stored under `$QDATA_DIR` shrink, while preserving every
+    job. Print `ok`, exit 0.
 
 - `q pause` / `q drain` / `q resume`
   - See Pause / resume / drain above.
@@ -397,9 +452,13 @@ print a message to stderr.
     indirectly). Claimed dependents are NOT cancelled (they stay
     `claimed`). Print a JSON array of cancelled ids sorted by id
     ascending (include the root).
+  - Cascade cancel of a root MUST NOT cancel or change an unrelated
+    pending job (one that does not depend on the root, directly or
+    indirectly). Cancelling one branch MUST NOT kill a sibling that does
+    not depend on that branch.
   - Interaction with dependency failure: after a non-cascade cancel,
     dependents that were not cancelled remain `pending` until a later
-    command's pre-step marks them `dead` with `last_error`
+    command's background obligations mark them `dead` with `last_error`
     `"dependency failed"`.
 
 - Any unknown command: exit 2.

@@ -50,3 +50,31 @@ def test_resume_then_claim_succeeds(q):
     job = q.json("claim")
     assert job["id"] == "p4"
     assert job["status"] == "claimed"
+
+
+def test_pause_allows_complete_and_fail_of_claimed(q):
+    """Pause must not prevent complete/fail of an already-claimed job."""
+    q.run("enqueue", "--payload", "{}", "--id", "done_me")
+    q.run("enqueue", "--payload", "{}", "--id", "fail_me",
+          "--max-attempts", "1")
+    c1 = q.json("claim")
+    assert c1["id"] == "done_me"
+    c2 = q.json("claim")
+    assert c2["id"] == "fail_me"
+    assert q.run("pause").returncode == 0
+    cp = q.run("complete", "done_me", "--fence", str(c1["fence"]),
+               "--result", '{"ok":true}')
+    assert cp.returncode == 0, cp.stderr
+    assert q.json("show", "done_me")["status"] == "done"
+    cp = q.run("fail", "fail_me", "--fence", str(c2["fence"]),
+               "--error", "boom")
+    assert cp.returncode == 0, cp.stderr
+    dead = q.json("show", "fail_me")
+    assert dead["status"] == "dead"
+    assert dead["last_error"] == "boom"
+    # New claims still blocked while paused.
+    q.run("enqueue", "--payload", "{}", "--id", "still_pending")
+    cp = q.run("claim")
+    assert cp.returncode == 1
+    assert "queue paused" in cp.stderr
+    assert q.json("show", "still_pending")["status"] == "pending"

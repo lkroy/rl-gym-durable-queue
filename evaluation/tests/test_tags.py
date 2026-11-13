@@ -68,3 +68,21 @@ def test_priority_order_within_same_tag(q):
     assert job["id"] == "mid"
     job = q.json("claim", "--tag", "p")
     assert job["id"] == "lo"
+
+
+def test_complete_tagged_leaves_untagged_claimable(q):
+    """Completing a tagged job must not affect an untagged pending job."""
+    q.run("enqueue", "--payload", "{}", "--id", "tagged", "--tag", "alpha")
+    q.run("enqueue", "--payload", '{"u":1}', "--id", "untagged")
+    before = q.json("show", "untagged")
+    job = q.json("claim", "--tag", "alpha")
+    assert job["id"] == "tagged"
+    assert q.run("complete", "tagged", "--fence",
+                 str(job["fence"])).returncode == 0
+    after = q.json("show", "untagged")
+    assert after["status"] == "pending"
+    assert after["payload"] == before["payload"]
+    assert after["tag"] is None
+    claimed = q.json("claim")
+    assert claimed["id"] == "untagged"
+    assert claimed["tag"] is None
