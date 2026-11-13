@@ -107,7 +107,9 @@ mutant("m07_delay",
            s,
            "    cands = [j for j in jobs.values()\n"
            "             if (j[\"status\"] == \"pending\" and j[\"run_at\"] <= t\n"
-           "                 and _deps_satisfied(jobs, j, t))]",
+           "                 and _deps_satisfied(jobs, j, t)\n"
+           "                 and ((tag is None and j.get(\"tag\") is None)\n"
+           "                      or (tag is not None and j.get(\"tag\") == tag)))]",
            "    cands = [j for j in jobs.values()\n"
            "             if j[\"status\"] == \"pending\"]  # BUG: run_at ignored"))
 
@@ -246,9 +248,13 @@ mutant("m18_deps",
            s,
            "    cands = [j for j in jobs.values()\n"
            "             if (j[\"status\"] == \"pending\" and j[\"run_at\"] <= t\n"
-           "                 and _deps_satisfied(jobs, j, t))]",
+           "                 and _deps_satisfied(jobs, j, t)\n"
+           "                 and ((tag is None and j.get(\"tag\") is None)\n"
+           "                      or (tag is not None and j.get(\"tag\") == tag)))]",
            "    cands = [j for j in jobs.values()\n"
-           "             if j[\"status\"] == \"pending\" and j[\"run_at\"] <= t]  # BUG: depends_on ignored"))
+           "             if (j[\"status\"] == \"pending\" and j[\"run_at\"] <= t\n"
+           "                 and ((tag is None and j.get(\"tag\") is None)\n"
+           "                      or (tag is not None and j.get(\"tag\") == tag)))]  # BUG: depends_on ignored"))
 
 
 # 19. pause flag not persisted (only in-memory / not loaded)
@@ -258,7 +264,7 @@ mutant("m19_pause",
        lambda s: replace_function(
            s, "load_meta",
            "def load_meta(dirpath):\n"
-           "    return {\"paused\": False}  # BUG: pause never loaded from disk\n\n"))
+           "    return {\"paused\": False, \"draining\": False}  # BUG: pause never loaded from disk\n\n"))
 
 
 # 20. --cascade only cancels direct dependents, not transitive
@@ -276,6 +282,87 @@ mutant("m20_cascade",
            "        if root_id in (job.get(\"depends_on\") or []):\n"
            "            out.append(job[\"id\"])\n"
            "    return out\n\n"))
+
+
+# 21. drain flag not persisted
+mutant("m21_drain_persist",
+       "drain flag not persisted (always loads draining=false)",
+       ["test_drain.py::test_drain_survives_new_process"],
+       lambda s: replace_function(
+           s, "load_meta",
+           "def load_meta(dirpath):\n"
+           "    meta = _load_meta_snapshot(os.path.join(dirpath, \"snapshot.json\"))\n"
+           "    wal_meta = _load_wal_meta(os.path.join(dirpath, \"wal.log\"))\n"
+           "    if wal_meta is not None:\n"
+           "        meta = wal_meta\n"
+           "    meta[\"draining\"] = False  # BUG: drain never persisted/loaded\n"
+           "    return meta\n\n"))
+
+
+# 22. untagged claim also returns tagged jobs
+mutant("m22_tag_leak",
+       "claim without --tag also returns tagged jobs",
+       ["test_tags.py::test_untagged_claim_skips_tagged_jobs"],
+       lambda s: sub_once(
+           s,
+           "    cands = [j for j in jobs.values()\n"
+           "             if (j[\"status\"] == \"pending\" and j[\"run_at\"] <= t\n"
+           "                 and _deps_satisfied(jobs, j, t)\n"
+           "                 and ((tag is None and j.get(\"tag\") is None)\n"
+           "                      or (tag is not None and j.get(\"tag\") == tag)))]",
+           "    cands = [j for j in jobs.values()\n"
+           "             if (j[\"status\"] == \"pending\" and j[\"run_at\"] <= t\n"
+           "                 and _deps_satisfied(jobs, j, t)\n"
+           "                 and (tag is None or j.get(\"tag\") == tag))]  # BUG: untagged sees tagged"))
+
+
+# 23. while paused, idempotency key never returns in-flight job
+mutant("m23_pause_idem",
+       "while paused, idempotency key never returns in-flight job (always queue paused)",
+       ["test_interactions.py::test_pause_idempotency_inflight_vs_new"],
+       lambda s: sub_once(
+           s,
+           "    idem = ctx[\"idem\"]\n"
+           "    # CRITICAL: while paused, an idempotency-key retry of an in-flight\n"
+           "    # (claimed, unexpired) job still returns that job. New claims do not.\n"
+           "    if key is not None:\n",
+           "    idem = ctx[\"idem\"]\n"
+           "    if ctx[\"meta\"].get(\"paused\"):\n"
+           "        die(\"queue paused\", 1)  # BUG: no in-flight idem exception\n"
+           "    if key is not None:\n"))
+
+
+# 24. claim --count does not skip unmet deps
+mutant("m24_count_deps",
+       "claim --count does not skip unmet deps (claims blocked / fails to fill)",
+       ["test_interactions.py::test_claim_count_skips_blocked_deps_fills_ready"],
+       lambda s: sub_once(
+           s,
+           "    cands = [j for j in jobs.values()\n"
+           "             if (j[\"status\"] == \"pending\" and j[\"run_at\"] <= t\n"
+           "                 and _deps_satisfied(jobs, j, t)\n"
+           "                 and ((tag is None and j.get(\"tag\") is None)\n"
+           "                      or (tag is not None and j.get(\"tag\") == tag)))]",
+           "    cands = [j for j in jobs.values()\n"
+           "             if (j[\"status\"] == \"pending\" and j[\"run_at\"] <= t\n"
+           "                 and (count == 1 or True) and (count == 1 and _deps_satisfied(jobs, j, t) or count > 1)\n"
+           "                 and ((tag is None and j.get(\"tag\") is None)\n"
+           "                      or (tag is not None and j.get(\"tag\") == tag)))]  # BUG: count ignores deps"))
+
+
+# 25. resume clears paused but not draining
+mutant("m25_resume_partial",
+       "resume clears paused but not draining",
+       ["test_drain.py::test_resume_clears_drain"],
+       lambda s: replace_function(
+           s, "cmd_resume",
+           "def cmd_resume(args, jobs, t, dirty, ctx):\n"
+           "    # BUG: clears paused but not draining\n"
+           "    if ctx[\"meta\"].get(\"paused\"):\n"
+           "        ctx[\"meta\"][\"paused\"] = False\n"
+           "        ctx[\"meta_dirty\"] = True\n"
+           "    sys.stdout.write(\"resumed\\n\")\n"
+           "    return 0\n\n"))
 
 
 def main():

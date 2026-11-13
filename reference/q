@@ -22,6 +22,7 @@ import time
 import zoneinfo
 
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+TAG_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 STATUSES = ("pending", "claimed", "done", "dead")
 
 
@@ -274,16 +275,21 @@ def load_idem(dirpath):
     return idem
 
 
+def _meta_from_dict(raw):
+    if not isinstance(raw, dict):
+        return {"paused": False, "draining": False}
+    return {"paused": bool(raw.get("paused", False)),
+            "draining": bool(raw.get("draining", False))}
+
+
 def _load_meta_snapshot(path):
     try:
         with open(path, "r", encoding="utf-8") as f:
             obj = json.load(f)
     except (FileNotFoundError, ValueError, OSError):
-        return {"paused": False}
+        return {"paused": False, "draining": False}
     meta = obj.get("meta") if isinstance(obj, dict) else None
-    if not isinstance(meta, dict):
-        return {"paused": False}
-    return {"paused": bool(meta.get("paused", False))}
+    return _meta_from_dict(meta)
 
 
 def _load_wal_meta(path):
@@ -297,7 +303,7 @@ def _load_wal_meta(path):
                     continue
                 obj = json.loads(line)
                 if obj.get("op") == "meta" and isinstance(obj.get("meta"), dict):
-                    meta = {"paused": bool(obj["meta"].get("paused", False))}
+                    meta = _meta_from_dict(obj["meta"])
     except FileNotFoundError:
         pass
     return meta
@@ -326,12 +332,13 @@ def append_ops(dirpath, ops):
 
 def write_snapshot(dirpath, jobs, idem, schedules, meta=None):
     if meta is None:
-        meta = {"paused": False}
+        meta = {"paused": False, "draining": False}
     path = os.path.join(dirpath, "snapshot.json")
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"jobs": jobs, "idem": idem, "schedules": schedules,
-                   "meta": {"paused": bool(meta.get("paused", False))}},
+                   "meta": {"paused": bool(meta.get("paused", False)),
+                            "draining": bool(meta.get("draining", False))}},
                   f, separators=(",", ":"))
         f.flush()
         os.fsync(f.fileno())
@@ -661,6 +668,7 @@ def _materialize(schedules, jobs, t):
                 "ttl": None,
                 "fence": 0,
                 "depends_on": [],
+                "tag": None,
                 "claimed_at": None,
                 "lease_expires_at": None,
                 "last_error": None,
@@ -724,7 +732,18 @@ def _check_id_format(jid):
         die("invalid id: must match ^[A-Za-z0-9_-]{1,64}$", 2)
 
 
+def _check_tag_format(tag):
+    if not isinstance(tag, str) or not TAG_RE.match(tag):
+        die("invalid tag: must match ^[A-Za-z0-9_-]{1,32}$", 2)
+
+
+def _require_not_draining(ctx):
+    if ctx["meta"].get("draining"):
+        die("draining", 3)
+
+
 def cmd_enqueue(args, jobs, t, dirty, ctx):
+    _require_not_draining(ctx)
     try:
         payload = json.loads(args.payload)
     except ValueError:
@@ -742,6 +761,9 @@ def cmd_enqueue(args, jobs, t, dirty, ctx):
         die("max_attempts must be >= 1", 2)
     if args.ttl is not None and args.ttl <= 0:
         die("ttl must be > 0", 2)
+    tag = getattr(args, "tag", None)
+    if tag is not None:
+        _check_tag_format(tag)
     deps = _parse_depends_on_cli(getattr(args, "depends_on", None))
     _validate_depends_on(jid, deps, jobs)
     if args.dedupe_key is not None:
@@ -762,6 +784,7 @@ def cmd_enqueue(args, jobs, t, dirty, ctx):
         "ttl": args.ttl,
         "fence": 0,
         "depends_on": deps,
+        "tag": tag,
         "claimed_at": None,
         "lease_expires_at": None,
         "last_error": None,
@@ -808,12 +831,17 @@ def _validate_batch_element(el, i, jobs, seen_ids):
     for d in depends_on:
         if not isinstance(d, str) or d == "":
             die("empty depends_on token", 2)
+    tag = el.get("tag", None)
+    if tag is not None:
+        if not isinstance(tag, str) or not TAG_RE.match(tag):
+            die("invalid jobs: element %d has bad tag" % i, 2)
     return {"payload": el["payload"], "priority": priority, "delay": delay,
             "max_attempts": max_attempts, "id": jid,
-            "dedupe_key": dedupe_key, "depends_on": depends_on}
+            "dedupe_key": dedupe_key, "depends_on": depends_on, "tag": tag}
 
 
 def cmd_enqueue_batch(args, jobs, t, dirty, ctx):
+    _require_not_draining(ctx)
     try:
         items = json.loads(args.jobs)
     except ValueError:
@@ -894,6 +922,7 @@ def cmd_enqueue_batch(args, jobs, t, dirty, ctx):
             "ttl": None,
             "fence": 0,
             "depends_on": list(resolved_deps[i]),
+            "tag": spec["tag"],
             "claimed_at": None,
             "lease_expires_at": None,
             "last_error": None,
@@ -921,6 +950,8 @@ def cmd_list(args, jobs, t, dirty, ctx):
 
 def cmd_show(args, jobs, t, dirty, ctx):
     job = _get_job_or_die(jobs, args.id)
+    if "tag" not in job:
+        job["tag"] = None
     sys.stdout.write(json.dumps(job) + "\n")
     return 0
 
@@ -936,9 +967,12 @@ def cmd_claim(args, jobs, t, dirty, ctx):
         _check_id_format(key)
         if count > 1:
             die("--idempotency-key cannot be combined with --count > 1", 2)
-    if ctx["meta"].get("paused"):
-        die("queue paused", 1)
+    tag = getattr(args, "tag", None)
+    if tag is not None:
+        _check_tag_format(tag)
     idem = ctx["idem"]
+    # CRITICAL: while paused, an idempotency-key retry of an in-flight
+    # (claimed, unexpired) job still returns that job. New claims do not.
     if key is not None:
         entry = idem.get(key)
         if entry is not None:
@@ -946,13 +980,25 @@ def cmd_claim(args, jobs, t, dirty, ctx):
             if (job is not None and job["status"] == "claimed"
                     and job.get("lease_expires_at") is not None
                     and job["lease_expires_at"] > t):
-                # Same claim served again: same job, same fence, no bump.
+                # Same claim served again: same job, same fence, no bump,
+                # lease NOT extended. Works even while paused.
+                if "tag" not in job:
+                    job["tag"] = None
                 sys.stdout.write(json.dumps(job) + "\n")
                 return 0
-        # stale or missing mapping: fall through to a fresh claim
+        # stale or missing mapping: fall through (pause may then reject)
+    # Pause wins over drain for claim: if paused, reject new claims.
+    if ctx["meta"].get("paused"):
+        die("queue paused", 1)
+    # Candidates: pending, run_at<=now, deps done, AND tag filter.
+    # Without --tag: ONLY jobs whose tag is null. With --tag TAG: ONLY
+    # jobs whose tag equals TAG. Unmet deps are skipped so --count can
+    # fill from ready lower-priority jobs.
     cands = [j for j in jobs.values()
              if (j["status"] == "pending" and j["run_at"] <= t
-                 and _deps_satisfied(jobs, j, t))]
+                 and _deps_satisfied(jobs, j, t)
+                 and ((tag is None and j.get("tag") is None)
+                      or (tag is not None and j.get("tag") == tag)))]
     cands.sort(key=lambda j: (-j["priority"], j["created_at"], j["id"]))
     if not cands:
         die("no jobs available", 1)
@@ -962,6 +1008,8 @@ def cmd_claim(args, jobs, t, dirty, ctx):
         job["claimed_at"] = t
         job["lease_expires_at"] = t + args.lease
         job["fence"] = job.get("fence", 0) + 1
+        if "tag" not in job:
+            job["tag"] = None
         dirty.add(job["id"])
     if key is not None:
         job = picked[0]
@@ -984,10 +1032,23 @@ def cmd_pause(args, jobs, t, dirty, ctx):
     return 0
 
 
-def cmd_resume(args, jobs, t, dirty, ctx):
-    if ctx["meta"].get("paused"):
-        ctx["meta"]["paused"] = False
+def cmd_drain(args, jobs, t, dirty, ctx):
+    if not ctx["meta"].get("draining"):
+        ctx["meta"]["draining"] = True
         ctx["meta_dirty"] = True
+    sys.stdout.write("draining\n")
+    return 0
+
+
+def cmd_resume(args, jobs, t, dirty, ctx):
+    # Clears BOTH paused and draining.
+    if ctx["meta"].get("paused") or ctx["meta"].get("draining"):
+        ctx["meta"]["paused"] = False
+        ctx["meta"]["draining"] = False
+        ctx["meta_dirty"] = True
+    else:
+        ctx["meta"]["paused"] = False
+        ctx["meta"]["draining"] = False
     sys.stdout.write("resumed\n")
     return 0
 
@@ -1086,6 +1147,7 @@ def _new_sched_id(schedules, jobs):
 
 
 def cmd_schedule(args, jobs, t, dirty, ctx):
+    _require_not_draining(ctx)
     try:
         payload = json.loads(args.payload)
     except ValueError:
@@ -1178,6 +1240,7 @@ COMMANDS = {
     "extend-lease": cmd_extend_lease,
     "compact": cmd_compact,
     "pause": cmd_pause,
+    "drain": cmd_drain,
     "resume": cmd_resume,
     "cancel": cmd_cancel,
 }
@@ -1195,6 +1258,7 @@ def parse_args(argv):
     e.add_argument("--max-attempts", type=int, default=3)
     e.add_argument("--ttl", type=float, default=None)
     e.add_argument("--depends-on", dest="depends_on", default=None)
+    e.add_argument("--tag", default=None)
     b = sub.add_parser("enqueue-batch", allow_abbrev=False)
     b.add_argument("--jobs", required=True)
     li = sub.add_parser("list", allow_abbrev=False)
@@ -1205,6 +1269,7 @@ def parse_args(argv):
     cl.add_argument("--lease", type=float, default=60.0)
     cl.add_argument("--idempotency-key", default=None)
     cl.add_argument("--count", type=int, default=None)
+    cl.add_argument("--tag", default=None)
     co = sub.add_parser("complete", allow_abbrev=False)
     co.add_argument("id")
     co.add_argument("--fence", type=int, default=None)
@@ -1231,6 +1296,7 @@ def parse_args(argv):
     x.add_argument("--lease", type=float, required=True)
     sub.add_parser("compact", allow_abbrev=False)
     sub.add_parser("pause", allow_abbrev=False)
+    sub.add_parser("drain", allow_abbrev=False)
     sub.add_parser("resume", allow_abbrev=False)
     ca = sub.add_parser("cancel", allow_abbrev=False)
     ca.add_argument("id")
@@ -1299,7 +1365,8 @@ def main(argv):
                                 "lease_expires_at": entry["lease_expires_at"]})
             if meta_dirty:
                 ops.append({"op": "meta", "meta": {
-                    "paused": bool(meta.get("paused", False))}})
+                    "paused": bool(meta.get("paused", False)),
+                    "draining": bool(meta.get("draining", False))}})
             append_ops(dirpath, ops)
             write_snapshot(dirpath, jobs, idem, schedules, meta)
         return code

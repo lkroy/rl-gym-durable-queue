@@ -205,17 +205,57 @@ acceptance_criteria:
       - test_deps.py::test_ttl_expiry_of_dep_kills_dependent
 
   REQ-PAUSE:
-    description: q pause / q resume set a durable paused flag (survives process restart); claim while paused -> exit 1, stderr contains "queue paused", does not claim; enqueue and other non-claim commands still work while paused; pre-steps still run while paused.
+    description: q pause / q resume set durable meta flags (survives process restart); resume clears BOTH paused and draining; claim while paused -> exit 1 "queue paused" except in-flight idempotency-key retry; enqueue and other non-claim commands still work while paused; pre-steps still run while paused.
     checks:
       - test_pause.py::test_claim_rejected_while_paused
       - test_pause.py::test_pause_survives_new_process
       - test_pause.py::test_enqueue_while_paused_then_resume_claim
       - test_pause.py::test_resume_then_claim_succeeds
+      - test_interactions.py::test_pause_idempotency_inflight_vs_new
 
   REQ-CANCEL:
-    description: q cancel ID [--cascade] requires pending (else "not pending" exit 3); unknown id -> 4; sets dead/last_error "cancelled"; without --cascade prints id; with --cascade also cancels transitive pending dependents and prints sorted JSON id array including root; discard idempotency mappings; non-cascade leave dependents to die later via dependency-failed pre-step.
+    description: q cancel ID [--cascade] requires pending (else "not pending" exit 3); unknown id -> 4; sets dead/last_error "cancelled"; without --cascade prints id; with --cascade also cancels transitive pending dependents (NOT claimed) and prints sorted JSON id array including root; discard idempotency mappings; non-cascade leave dependents to die later via dependency-failed pre-step.
     checks:
       - test_cancel.py::test_cancel_pending_to_dead_cancelled
       - test_cancel.py::test_cancel_claimed_not_pending
       - test_cancel.py::test_cascade_cancels_transitive_pending
       - test_cancel.py::test_without_cascade_dependent_becomes_dependency_failed
+
+  REQ-DRAIN:
+    description: q drain sets durable draining=true (survives restart); enqueue/enqueue-batch/schedule while draining -> exit 3 stderr contains "draining", create nothing; claim/complete/fail/cancel/list/show/stats/compact/unschedule/pause/extend-lease still work; resume clears BOTH paused and draining; if paused and draining, claim uses pause rule.
+    checks:
+      - test_drain.py::test_drain_blocks_enqueue
+      - test_drain.py::test_drain_blocks_schedule
+      - test_drain.py::test_claim_works_while_draining
+      - test_drain.py::test_resume_clears_drain
+      - test_drain.py::test_drain_survives_new_process
+      - test_drain.py::test_pause_and_drain_claim_uses_pause
+
+  REQ-TAGS:
+    description: Job field tag (string or null, default null) always present in show/claim; enqueue --tag / batch tag must match ^[A-Za-z0-9_-]{1,32}$ else exit 2; schedule-materialized tag null; claim without --tag only null-tag jobs; claim --tag TAG only exact match; hard partition; dedupe global; deps/priority/run_at/pause/drain apply on top.
+    checks:
+      - test_tags.py::test_untagged_claim_skips_tagged_jobs
+      - test_tags.py::test_tagged_claim_skips_untagged_jobs
+      - test_tags.py::test_invalid_tag_rejected
+      - test_tags.py::test_claim_count_with_tags_only_matching
+      - test_tags.py::test_priority_order_within_same_tag
+
+  REQ-PAUSE-IDEMP:
+    description: While paused, claim --idempotency-key KEY that maps to a currently claimed unexpired job returns that job (same fence, lease not extended) exit 0; otherwise claim while paused -> exit 1 queue paused.
+    checks:
+      - test_interactions.py::test_pause_idempotency_inflight_vs_new
+      - test_pause.py::test_claim_rejected_while_paused
+
+  REQ-INTERACTIONS:
+    description: Cross-feature interactions — pause+schedule materialize, pause+idempotency, claim --count skipping unmet deps, waiter TTL expires as expired while dep pending, cascade skips claimed dependents, drain+batch, fail-requeue blocks dependents, tagged-on-untagged deps, compact preserves meta/tag/depends_on, parallel mixed-tag claims.
+    checks:
+      - test_interactions.py::test_pause_schedule_materialize_then_resume_claim
+      - test_interactions.py::test_pause_idempotency_inflight_vs_new
+      - test_interactions.py::test_claim_count_skips_blocked_deps_fills_ready
+      - test_interactions.py::test_waiter_ttl_expires_as_expired_while_dep_pending
+      - test_interactions.py::test_cascade_does_not_cancel_claimed_dependents
+      - test_interactions.py::test_drain_blocks_batch_existing_completable
+      - test_interactions.py::test_fail_requeue_dep_keeps_dependent_blocked
+      - test_interactions.py::test_tagged_depends_on_untagged_dep
+      - test_interactions.py::test_compact_preserves_meta_and_fields
+      - test_interactions.py::test_parallel_claim_mixed_tags_no_double_delivery

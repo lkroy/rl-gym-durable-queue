@@ -2,14 +2,14 @@
 
 A single-executable CLI (`q`, Python 3 stdlib only) managing a persistent,
 crash-safe job queue on disk: enqueue / list / show / claim / complete /
-fail / stats / compact / pause / resume / cancel, with priorities, delayed
-scheduling, deduplication, lease-based claiming, exponential-backoff
+fail / stats / compact / pause / drain / resume / cancel, with priorities,
+delayed scheduling, deduplication, lease-based claiming, exponential-backoff
 retries, dead-lettering, idempotent claim (`--idempotency-key`), atomic
 batch enqueue, recurring schedules (`--cron`, timezone-aware via `--tz`),
 message TTL, lease extension, fencing tokens for stale-worker protection,
-multi-claim (`claim --count N`), job dependencies (`--depends-on`),
-pause/resume, cascade cancel, a write-ahead log + snapshot with torn-tail
-recovery, and `flock`-guarded concurrency.
+multi-claim (`claim --count N`), job dependencies (`--depends-on`), job
+tags (`--tag`), durable pause/drain/resume, cascade cancel, a write-ahead
+log + snapshot with torn-tail recovery, and `flock`-guarded concurrency.
 
 ## Repository structure
 
@@ -44,8 +44,9 @@ npm run generate          # real OpenHands model run (needs LLM_API_KEY)
 
 ## Scoring
 
-Weights (sum = 1.0): core 0.06, scheduling 0.06, retries 0.06, dedupe 0.04,
-lease 0.06, recovery 0.08, concurrency 0.07, idempotency 0.03, batch 0.03,
-cli 0.03, schedules 0.05, ttl 0.03, fencing 0.05, tz 0.04, claim_batch 0.03,
-deps 0.12, pause 0.08, cancel 0.08.
+Weights (sum = 1.0): interactions 0.18, deps 0.12, pause 0.07, cancel 0.07,
+drain 0.07, tags 0.06, recovery 0.07, concurrency 0.06, fencing 0.06,
+retries 0.04, lease 0.04, schedules 0.03, tz 0.02, ttl 0.02, scheduling 0.02,
+idempotency 0.02, batch 0.01, claim_batch 0.01, cli 0.01, dedupe 0.01,
+core 0.01.
 Per category: fraction of its checks passed x weight.

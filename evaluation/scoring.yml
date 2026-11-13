@@ -1,24 +1,27 @@
 # Weighted scoring for the durable-queue RL Gym task.
 # Weights MUST sum to exactly 1.0 (asserted by evaluation/score.py).
 weights:
-  core: 0.06
-  scheduling: 0.06
-  retries: 0.06
-  dedupe: 0.04
-  lease: 0.06
-  recovery: 0.08
-  concurrency: 0.07
-  idempotency: 0.03
-  batch: 0.03
-  cli: 0.03
-  schedules: 0.05
-  ttl: 0.03
-  fencing: 0.05
-  tz: 0.04
-  claim_batch: 0.03
+  interactions: 0.18
   deps: 0.12
-  pause: 0.08
-  cancel: 0.08
+  pause: 0.07
+  cancel: 0.07
+  drain: 0.07
+  tags: 0.06
+  recovery: 0.07
+  concurrency: 0.06
+  fencing: 0.06
+  retries: 0.04
+  lease: 0.04
+  schedules: 0.03
+  tz: 0.02
+  ttl: 0.02
+  scheduling: 0.02
+  idempotency: 0.02
+  batch: 0.01
+  claim_batch: 0.01
+  cli: 0.01
+  dedupe: 0.01
+  core: 0.01
 
 # Each category maps to the pytest file whose checks it owns.
 files:
@@ -40,3 +43,6 @@ files:
   deps: test_deps.py
   pause: test_pause.py
   cancel: test_cancel.py
+  drain: test_drain.py
+  tags: test_tags.py
+  interactions: test_interactions.py

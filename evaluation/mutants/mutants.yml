@@ -105,3 +105,28 @@ mutants:
     file: m20_cascade
     must_fail:
     - test_cancel.py::test_cascade_cancels_transitive_pending
+  m21_drain_persist:
+    bug: drain flag not persisted (always loads draining=false)
+    file: m21_drain_persist
+    must_fail:
+    - test_drain.py::test_drain_survives_new_process
+  m22_tag_leak:
+    bug: claim without --tag also returns tagged jobs
+    file: m22_tag_leak
+    must_fail:
+    - test_tags.py::test_untagged_claim_skips_tagged_jobs
+  m23_pause_idem:
+    bug: while paused, idempotency key never returns in-flight job (always queue paused)
+    file: m23_pause_idem
+    must_fail:
+    - test_interactions.py::test_pause_idempotency_inflight_vs_new
+  m24_count_deps:
+    bug: claim --count does not skip unmet deps (claims blocked / fails to fill)
+    file: m24_count_deps
+    must_fail:
+    - test_interactions.py::test_claim_count_skips_blocked_deps_fills_ready
+  m25_resume_partial:
+    bug: resume clears paused but not draining
+    file: m25_resume_partial
+    must_fail:
+    - test_drain.py::test_resume_clears_drain

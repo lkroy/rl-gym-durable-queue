@@ -64,14 +64,16 @@ Fields and defaults:
 | lease_expires_at   | float or null     | null                             |
 | fence              | int               | 0 (see Fencing tokens)             |
 | depends_on         | list of job ids   | []                               |
+| tag                | string or null    | null                             |
 | last_error         | string or null    | null                             |
 | result             | any JSON or null  | null                             |
 
 `status` is one of `pending`, `claimed`, `done`, `dead`.
 
 Every job always carries `depends_on` (a list of job ids it waits on;
-default `[]`). Schedule-materialized jobs always get `depends_on: []`.
-`show` and `claim` output include `depends_on`.
+default `[]`) and `tag` (string or null; default `null`).
+Schedule-materialized jobs always get `depends_on: []` and `tag: null`.
+`show` and `claim` output always include `depends_on` and `tag`.
 
 ## Fencing tokens
 
@@ -123,19 +125,39 @@ one atomic unit with the command itself:
    dependency also kills its dependents in the same command.
 
 These pre-steps (materialize, lease sweep, TTL sweep, dep-failure
-cascade) still run when the queue is paused.
+cascade) still run when the queue is paused **and** when it is draining.
+A waiter with its own TTL that expires becomes `dead` with
+`last_error` `"expired"` even if its dependency is still `pending`
+(TTL runs before the dep-failure cascade, so the waiter is not marked
+`"dependency failed"`).
 
-## Pause / resume
+## Pause / resume / drain
 
-The queue has a durable paused flag (default false). It MUST survive
-process restart and crash.
+Queue meta is `{paused: bool, draining: bool}` (both default false).
+Both flags MUST be durable (survive process restart and crash) and MUST
+be persisted in the same snapshot + WAL meta ops.
 
 - `q pause` — set paused=true, print `paused`, exit 0. Idempotent.
-- `q resume` — set paused=false, print `resumed`, exit 0. Idempotent.
-- While paused: `q claim` MUST exit 1 and stderr MUST contain
-  `queue paused` (even if claimable candidates exist). Do NOT claim.
+- `q drain` — set draining=true, print `draining`, exit 0. Idempotent.
+- `q resume` — clear BOTH paused and draining, print `resumed`, exit 0.
+  Idempotent.
+- While paused: a **new** `q claim` MUST exit 1 and stderr MUST contain
+  `queue paused` (even if claimable candidates exist). Do NOT claim a
+  new job. **Exception (CRITICAL):** if `claim --idempotency-key KEY`
+  and KEY maps to a job that is currently `claimed` with an unexpired
+  lease, return THAT job (same fence), exit 0. Do NOT extend the lease.
+  This is a retry of in-flight work, not a new claim. Any other key (or
+  no key) while paused → `queue paused`.
+- While draining: `enqueue`, `enqueue-batch`, and `schedule` MUST exit 3
+  and stderr MUST contain `draining` (create nothing). claim / complete /
+  fail / cancel / list / show / stats / compact / unschedule / pause /
+  extend-lease still work while draining.
+- If both paused and draining: claim uses the pause rule (`queue paused`,
+  exit 1, with the idempotency-key exception above) — pause wins over
+  drain for claim.
 - Enqueue, complete, fail, schedule, cancel, list, show, stats, compact
-  (and the other non-claim mutations) still work while paused.
+  (and the other non-claim mutations) still work while paused (but
+  enqueue/enqueue-batch/schedule are blocked while draining).
 
 ## Commands
 
@@ -144,8 +166,9 @@ print a message to stderr.
 
 - `q enqueue --payload JSON [--priority INT] [--delay SEC] [--id ID]
   [--dedupe-key KEY] [--max-attempts N] [--ttl SEC]
-  [--depends-on ID[,ID...]]`
+  [--depends-on ID[,ID...]] [--tag TAG]`
   - On success: print the job id followed by a newline to stdout, exit 0.
+  - While draining: exit 3, stderr MUST contain `draining`, create nothing.
   - `--payload` MUST be valid JSON, otherwise exit 2.
   - `--id`, when given, MUST match `^[A-Za-z0-9_-]{1,64}$`, otherwise exit 2.
   - `--id` MUST NOT duplicate an existing job id, otherwise exit 2.
@@ -155,6 +178,8 @@ print a message to stderr.
   - `--ttl`, when given, MUST be > 0, otherwise exit 2. The job expires
     `ttl` seconds after `created_at` (see pre-step 3). A delayed job can
     expire before ever becoming claimable.
+  - `--tag TAG`, when given, MUST match `^[A-Za-z0-9_-]{1,32}$`, otherwise
+    exit 2. Stored as the job's `tag` (default `null` when omitted).
   - `--depends-on` is a comma-separated list of job ids this job waits
     on (stored as `depends_on`). Validation failures exit 2:
     - unknown dependency id
@@ -164,20 +189,22 @@ print a message to stderr.
     - an empty token in the list (e.g. `a,,b` or a trailing/leading comma)
   - Dedupe: if `--dedupe-key` is given and a job with the same key exists
     with status `pending` or `claimed`, print THAT job's id, exit 0, and
-    create nothing. A key whose previous job is `done` (or `dead`) does NOT
-    block a new enqueue.
+    create nothing. Deduping is **global** (not per-tag). A key whose
+    previous job is `done` (or `dead`) does NOT block a new enqueue.
 
 - `q enqueue-batch --jobs '<json-array>'`
   - Enqueue many jobs atomically: either ALL of them are created or NONE
     is. `--jobs` MUST be a JSON array, otherwise exit 2.
+  - While draining: exit 3, stderr MUST contain `draining`, create nothing.
   - Each element is an object with `payload` (required, any JSON) and
     optional `priority`, `delay`, `id`, `dedupe_key`, `max_attempts`,
     `depends_on` (a JSON array of job ids; same meaning as enqueue's
-    `--depends-on`). Validate EVERY element before creating anything:
+    `--depends-on`), `tag` (string matching `^[A-Za-z0-9_-]{1,32}$`, or
+    omit/`null`). Validate EVERY element before creating anything:
     any invalid element (bad JSON types, bad `id` format, duplicate `id`
     within the batch or against existing jobs, negative `delay`,
-    `max_attempts` < 1, missing `payload`, bad `depends_on`) aborts the
-    whole batch with exit 2 and creates NOTHING.
+    `max_attempts` < 1, missing `payload`, bad `depends_on`, bad `tag`)
+    aborts the whole batch with exit 2 and creates NOTHING.
   - `depends_on` may reference existing jobs OR other elements' ids in
     the same batch; after dedupe resolution use the resolved id. Validate
     cycles including the batch-as-a-whole before creating anything; if
@@ -202,8 +229,8 @@ print a message to stderr.
   - Print the full job object as JSON, exit 0.
   - Unknown id: stderr MUST contain `job not found`, exit 4.
 
-- `q claim [--lease SEC] [--idempotency-key KEY] [--count N]` (defaults:
-  lease 60, count 1)
+- `q claim [--lease SEC] [--idempotency-key KEY] [--count N] [--tag TAG]`
+  (defaults: lease 60, count 1)
   - `--lease` MUST be > 0, otherwise exit 2.
   - `--count` MUST be an integer >= 1, otherwise exit 2. With `--count N`,
     up to N candidates are claimed atomically, in claim order; each one
@@ -211,14 +238,21 @@ print a message to stderr.
     fence incremented. The whole multi-claim is one atomic unit:
     concurrent `claim` invocations MUST NEVER deliver the same job twice,
     whatever `--count` each used.
+  - `--tag TAG`, when given, MUST match `^[A-Za-z0-9_-]{1,32}$`, otherwise
+    exit 2.
   - `--idempotency-key`, when given, MUST match `^[A-Za-z0-9_-]{1,64}$`,
     otherwise exit 2. It is only valid with the default `--count 1`;
     combining it with `--count` > 1 is exit 2.
-  - The pre-steps run first (materialization, lease sweep, TTL sweep).
+  - The pre-steps run first (materialization, lease sweep, TTL sweep,
+    dep-failure cascade).
   - If KEY is given and maps to a job that is currently `claimed` with an
     unexpired lease, return THAT job (full JSON, same fence), exit 0. Do
     NOT claim a new job and do NOT extend the lease. This gives
-    exactly-once delivery across client retries and crashes.
+    exactly-once delivery across client retries and crashes, **and it
+    applies even while the queue is paused** (see Pause / resume / drain).
+  - Otherwise, if the queue is paused: stderr MUST contain `queue paused`,
+    exit 1. Do NOT claim a new job (even when candidates exist). Pause
+    wins over drain for claim.
   - Otherwise claim the best candidate(s) as usual; if a candidate is
     claimed, record KEY as mapped to it (replacing any stale mapping).
     Mappings for jobs that become `done` or `dead` are discarded, so a
@@ -227,17 +261,24 @@ print a message to stderr.
     concurrency: two processes claiming at the same time with the same
     KEY MUST receive the same job, never two different jobs.
   - Candidates: status `pending` AND `run_at <= now` AND every id in
-    `depends_on` refers to a job whose status is `done`. A higher-priority
-    job blocked on unmet dependencies MUST NOT prevent claiming a
-    lower-priority job whose dependencies are satisfied.
-  - If the queue is paused: stderr MUST contain `queue paused`, exit 1.
-    Do NOT claim (even when candidates exist).
+    `depends_on` refers to a job whose status is `done` AND the tag
+    filter matches:
+    - Without `--tag`: ONLY jobs whose `tag` is `null`.
+    - With `--tag TAG`: ONLY jobs whose `tag` equals TAG (exact).
+    This is a hard partition: an untagged claim never sees tagged jobs
+    and a tagged claim never sees untagged jobs. depends_on / priority /
+    run_at / pause / drain still apply on top of the tag filter.
+  - A higher-priority job blocked on unmet dependencies MUST NOT prevent
+    claiming a lower-priority job whose dependencies are satisfied.
+    With `--count N`, skip unmet deps and fill up to N from ready jobs
+    after filters. If zero ready after filters → exit 1
+    `no jobs available` (or the queue-paused rule first).
   - Order: `priority` descending, then `created_at` ascending, then `id`
     ascending. Claim the first candidate(s): set status `claimed`,
     `claimed_at = now`, `lease_expires_at = now + lease`, bump the fence.
   - Print the full job object as JSON (for `--count N`, a JSON array of
     the claimed job objects in claim order), exit 0. The job object
-    includes `depends_on`.
+    includes `depends_on` and `tag`.
   - If no candidate: stderr MUST contain `no jobs available`, exit 1.
 
 - `q complete ID --fence F [--result JSON]`
@@ -271,6 +312,7 @@ print a message to stderr.
 
 - `q schedule --payload JSON --cron EXPR [--id ID] [--priority INT]
   [--max-attempts N] [--end-at EPOCH] [--tz NAME]`
+  - While draining: exit 3, stderr MUST contain `draining`, create nothing.
   - Creates a recurring schedule. `--payload` MUST be valid JSON,
     otherwise exit 2. `--id`, when given, MUST match
     `^[A-Za-z0-9_-]{1,64}$` and MUST NOT duplicate an existing schedule
@@ -340,8 +382,8 @@ print a message to stderr.
     in compacted form so that the total bytes stored under `$QDATA_DIR`
     shrink. Print `ok`, exit 0.
 
-- `q pause` / `q resume`
-  - See Pause / resume above.
+- `q pause` / `q drain` / `q resume`
+  - See Pause / resume / drain above.
 
 - `q cancel ID [--cascade]`
   - Unknown id → exit 4.
@@ -352,7 +394,8 @@ print a message to stderr.
   - Without `--cascade`: print the id string followed by a newline.
   - With `--cascade`: also cancel (to `dead` / `"cancelled"`) every
     still-`pending` job that transitively depends on ID (directly or
-    indirectly). Print a JSON array of cancelled ids sorted by id
+    indirectly). Claimed dependents are NOT cancelled (they stay
+    `claimed`). Print a JSON array of cancelled ids sorted by id
     ascending (include the root).
   - Interaction with dependency failure: after a non-cascade cancel,
     dependents that were not cancelled remain `pending` until a later
@@ -368,5 +411,5 @@ print a message to stderr.
 - 2: usage / validation error
 - 3: state conflict (complete/fail/extend-lease on a job that is not
   claimed, or presented with a stale fence token; cancel on a
-  non-pending job)
+  non-pending job; enqueue / enqueue-batch / schedule while draining)
 - 4: not found (unknown job id)
