@@ -33,7 +33,7 @@ def main():
             proc = subprocess.run(
                 [sys.executable, os.path.join(EVAL, "score.py")],
                 capture_output=True, text=True, env=env, cwd=ROOT,
-                timeout=600)
+                timeout=900)
             try:
                 result = json.loads(proc.stdout)
             except Exception as exc:

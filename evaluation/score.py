@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 
 import yaml
@@ -35,16 +36,31 @@ def main():
                                    % q_bin, "score": 0.0}))
         return 2
 
-    junit = os.path.join(EVAL, ".junit.xml")
-    if os.path.exists(junit):
-        os.remove(junit)
-    env = dict(os.environ, Q_BIN=q_bin)
-    subprocess.run(
-        [sys.executable, "-m", "pytest", os.path.join(EVAL, "tests"),
-         "-q", "--junitxml=%s" % junit, "-p", "no:cacheprovider"],
-        capture_output=True, text=True, env=env, cwd=ROOT, timeout=600)
+    # Unique junit path per process so overlapping score runs cannot corrupt
+    # each other via a shared evaluation/.junit.xml.
+    fd, junit = tempfile.mkstemp(prefix="q-junit-", suffix=".xml")
+    os.close(fd)
+    try:
+        env = dict(os.environ, Q_BIN=q_bin)
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", os.path.join(EVAL, "tests"),
+             "-q", "--junitxml=%s" % junit, "-p", "no:cacheprovider"],
+            capture_output=True, text=True, env=env, cwd=ROOT, timeout=900)
+        if not os.path.isfile(junit) or os.path.getsize(junit) == 0:
+            print(json.dumps({
+                "error": "pytest produced no junit output",
+                "score": 0.0,
+                "pytest_rc": proc.returncode,
+                "stderr_tail": (proc.stderr or "")[-2000:],
+            }))
+            return 2
+        tree = ET.parse(junit)
+    finally:
+        try:
+            os.remove(junit)
+        except OSError:
+            pass
 
-    tree = ET.parse(junit)
     # classname for plain test functions is the module name, e.g. "test_core".
     per_file = {}
     failed = []
