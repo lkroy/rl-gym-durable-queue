@@ -54,3 +54,50 @@ def test_without_cascade_dependent_becomes_dependency_failed(q):
     assert child["status"] == "dead"
     assert child["last_error"] == "dependency failed"
     assert q.json("show", "root")["last_error"] == "cancelled"
+
+
+def test_cascade_does_not_affect_unrelated_pending(q):
+    """Cascade cancel of a root must not cancel/change an unrelated job."""
+    q.run("enqueue", "--payload", '{"k":1}', "--id", "root",
+          "--priority", "5")
+    q.run("enqueue", "--payload", "{}", "--id", "dep", "--depends-on", "root")
+    q.run("enqueue", "--payload", '{"k":2}', "--id", "unrelated",
+          "--priority", "3")
+    before = q.json("show", "unrelated")
+    cp = q.run("cancel", "root", "--cascade")
+    assert cp.returncode == 0, cp.stderr
+    cancelled = json.loads(cp.stdout)
+    assert "unrelated" not in cancelled
+    assert set(cancelled) == {"root", "dep"}
+    after = q.json("show", "unrelated")
+    assert after["status"] == "pending"
+    assert after["payload"] == before["payload"]
+    assert after["priority"] == before["priority"]
+    assert after["depends_on"] == []
+    job = q.json("claim")
+    assert job["id"] == "unrelated"
+
+
+def test_cancel_branch_does_not_kill_sibling(q):
+    """Cancelling one branch must not kill a sibling that does not depend on it."""
+    q.run("enqueue", "--payload", "{}", "--id", "shared")
+    q.run("enqueue", "--payload", "{}", "--id", "left",
+          "--depends-on", "shared")
+    q.run("enqueue", "--payload", "{}", "--id", "right",
+          "--depends-on", "shared")
+    q.run("enqueue", "--payload", "{}", "--id", "left_leaf",
+          "--depends-on", "left")
+    cp = q.run("cancel", "left", "--cascade")
+    assert cp.returncode == 0, cp.stderr
+    cancelled = json.loads(cp.stdout)
+    assert set(cancelled) == {"left", "left_leaf"}
+    assert "right" not in cancelled
+    assert "shared" not in cancelled
+    assert q.json("show", "right")["status"] == "pending"
+    assert q.json("show", "shared")["status"] == "pending"
+    # Complete shared; sibling right must become claimable.
+    shared = q.json("claim")
+    assert shared["id"] == "shared"
+    q.run("complete", "shared", "--fence", str(shared["fence"]))
+    right = q.json("claim")
+    assert right["id"] == "right"

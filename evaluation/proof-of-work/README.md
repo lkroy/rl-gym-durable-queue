@@ -55,6 +55,25 @@ The contracted post-submission Opus/Astra high-reasoning runs are the gate.
 Single-pass OpenHands on current `task/instruction.md` with two top models
 (e.g. Opus 5.5, Astra), high reasoning — both should score **&lt; 0.40**.
 
+## Workshop deck alignment
+
+Aligned with HackerRank RL Gym workshop guidance:
+
+1. **PRD instruction** — `task/instruction.md` is outcomes / rules / CLI
+   contract (not an implementation plan). Storage recipes (fsync, flock,
+   WAL, snapshot layout) are not prescribed; durability/crash/concurrency
+   are stated as observable outcomes. Background work is obligations, not
+   a numbered pre-step recipe.
+2. **Weight cap ≤ 10%** — every category in `evaluation/scoring.yml` is
+   ≤ 0.10; weights sum to exactly 1.0; many small checks.
+3. **Paired guards** — “did it” checks paired with “didn’t break” guards
+   (cascade leave unrelated jobs alone; drain preserves enqueued work;
+   tagged complete leaves untagged claimable; pause still allows
+   complete/fail of claimed jobs; cancel one branch does not kill
+   siblings).
+4. **Stub ≈ 0 / reference = 1.0** — unchanged public stub scores near 0;
+   reference still scores 1.0; mutants remain caught.
+
 ## Access / privacy
 
 - Repo should be **private**; invite `content.team@problemsetters.com`.

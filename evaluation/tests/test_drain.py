@@ -61,3 +61,27 @@ def test_pause_and_drain_claim_uses_pause(q):
     assert cp.returncode == 1
     assert "queue paused" in cp.stderr
     assert q.json("show", "pd1")["status"] == "pending"
+
+
+def test_drain_preserves_enqueued_jobs(q):
+    """Drain must not remove or alter already-enqueued jobs; they stay claimable."""
+    q.run("enqueue", "--payload", '{"n":1}', "--id", "keep1",
+          "--priority", "7")
+    q.run("enqueue", "--payload", '{"n":2}', "--id", "keep2",
+          "--priority", "3")
+    before = {jid: q.json("show", jid) for jid in ("keep1", "keep2")}
+    assert q.run("drain").returncode == 0
+    for jid, snap in before.items():
+        after = q.json("show", jid)
+        assert after["status"] == "pending"
+        assert after["payload"] == snap["payload"]
+        assert after["priority"] == snap["priority"]
+        assert after["tag"] == snap["tag"]
+        assert after["depends_on"] == snap["depends_on"]
+    assert q.json("stats")["pending"] == 2
+    assert q.json("stats")["total"] == 2
+    first = q.json("claim")
+    assert first["id"] == "keep1"
+    q.run("complete", "keep1", "--fence", str(first["fence"]))
+    second = q.json("claim")
+    assert second["id"] == "keep2"
